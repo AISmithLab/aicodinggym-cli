@@ -1,0 +1,39 @@
+[project]
+name = "aicodinggym-cli"
+version = "0.1.0"
+description = "CLI tool for AI Coding Gym platform"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "AICodingGym Team", email = "datasmithlab@gmail.com"}
+]
+keywords = ["cli", "coding-gym", "swebench", "mlebench", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "click>=8.0.0",
+    "requests>=2.31.0",
+]
+
+[project.urls]
+Homepage = "https://aicodinggym.com"
+
+[project.scripts]
+aicodinggym = "aicodinggym.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["aicodinggym"]
+
+[tool.setuptools.package-dir]
+aicodinggym = "."
