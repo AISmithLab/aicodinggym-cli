@@ -1,7 +1,6 @@
 """Git and SSH key operations for AI Coding Gym CLI."""
 
 import os
-import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -69,7 +68,6 @@ def clone_repo(repo_url: str, branch: str, dest_name: str,
             pull = run_git_command(f"git pull origin {branch}", str(problem_dir), key_path)
             if pull.returncode != 0:
                 return False, f"Git pull failed:\n{pull.stderr}"
-            _remove_github_dir(problem_dir)
             return True, f"Already exists. Updated to latest version.\nRepository: {problem_dir}\nBranch: {branch}"
         return False, (
             f"Directory {problem_dir} already exists with different content.\n"
@@ -82,7 +80,6 @@ def clone_repo(repo_url: str, branch: str, dest_name: str,
     if result.returncode != 0:
         return False, f"Git clone failed:\n{result.stderr}\nMake sure the branch '{branch}' exists in the repository."
 
-    _remove_github_dir(problem_dir)
     return True, f"Cloned to: {problem_dir}\nBranch: {branch}"
 
 
@@ -160,16 +157,6 @@ def reset_to_setup_commit(problem_dir: str) -> tuple[bool, str]:
     return True, f"Reset to setup commit {setup_commit[:8]}.\nLocal changes discarded and untracked files removed."
 
 
-def _remove_github_dir(problem_dir: Path) -> None:
-    """Remove .github directory and mark files as skip-worktree."""
-    github_dir = problem_dir / ".github"
-    if not github_dir.exists():
-        return
-
-    list_result = run_git_command("git ls-files .github", str(problem_dir))
-    if list_result.returncode == 0:
-        for rel_path in filter(None, list_result.stdout.splitlines()):
-            quoted = shlex.quote(rel_path)
-            run_git_command(f"git update-index --skip-worktree -- {quoted}", str(problem_dir))
-
-    shutil.rmtree(github_dir, ignore_errors=True)
+def check_tool_installed(tool_name: str) -> bool:
+    """Check if a CLI tool is available on PATH."""
+    return shutil.which(tool_name) is not None

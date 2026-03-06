@@ -17,6 +17,10 @@ MLE-BENCH WORKFLOW:
     aicodinggym mle submit spaceship-titanic -F submission.csv
 """
 
+import os
+import platform
+import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +45,7 @@ from .config import (
 )
 from .git_ops import (
     add_commit_push,
+    check_tool_installed,
     clone_repo,
     generate_ssh_key_pair,
     reset_to_setup_commit,
@@ -80,6 +85,109 @@ def _resolve_workspace(config: dict, workspace_dir: str | None) -> Path:
     if configured:
         return Path(configured).resolve()
     return Path.cwd().resolve()
+
+
+def _print_test_summary(lines: list[str], problem_id: str, returncode: int,
+                        elapsed: float = 0.0) -> None:
+    """Parse act output and print a clear test results summary."""
+
+    steps: list[tuple[str, str]] = []  # (status, name)
+    test_results: list[str] = []
+    failures: list[str] = []
+    errors: list[str] = []
+    ran_line = ""
+
+    for raw in lines:
+        line = raw.rstrip()
+
+        # Capture step results (Success/Failure lines)
+        m = re.search(r"(✅\s+Success|❌\s+Failure)\s+-\s+(.+?)(?:\s+\[.*\])?$", line)
+        if m:
+            status = "PASS" if "Success" in m.group(1) else "FAIL"
+            steps.append((status, m.group(2).strip()))
+
+        # Capture individual test results (PASS/FAIL/ERROR/ok lines)
+        test_m = re.search(r"\|\s+([\w_]+\s+\([\w.]+\))\s+\.\.\.\s+(ok|FAIL|ERROR)", line)
+        if test_m:
+            test_results.append(f"  {test_m.group(2):>5}  {test_m.group(1)}")
+
+        # Capture "Ran N tests" line
+        ran_m = re.search(r"Ran (\d+) tests? in (.+)", line)
+        if ran_m:
+            ran_line = ran_m.group(0)
+
+        # Capture FAIL/ERROR blocks
+        fail_m = re.search(r"\|\s+(FAIL|ERROR): (.+)", line)
+        if fail_m:
+            if fail_m.group(1) == "FAIL":
+                failures.append(fail_m.group(2))
+            else:
+                errors.append(fail_m.group(2))
+
+    click.echo("\n" + "=" * 60)
+    click.echo(f"  TEST SUMMARY — {problem_id}")
+    click.echo("=" * 60)
+
+    if steps:
+        click.echo("\nWorkflow steps:")
+        for status, name in steps:
+            icon = "PASS" if status == "PASS" else "FAIL"
+            click.echo(f"  [{icon}] {name}")
+
+    if test_results:
+        click.echo("\nTest results:")
+        for tr in test_results:
+            click.echo(tr)
+
+    if failures:
+        click.echo(f"\nFailed tests ({len(failures)}):")
+        for f in failures:
+            click.echo(f"  - {f}")
+
+    if errors:
+        click.echo(f"\nErrored tests ({len(errors)}):")
+        for e in errors:
+            click.echo(f"  - {e}")
+
+    if ran_line:
+        click.echo(f"\n{ran_line}")
+
+    if returncode == 0:
+        click.echo(f"\nResult: ALL TESTS PASSED")
+    else:
+        click.echo(f"\nResult: TESTS FAILED (exit code {returncode})")
+
+    if elapsed > 0:
+        minutes, seconds = divmod(int(elapsed), 60)
+        click.echo(f"Elapsed: {minutes}m {seconds}s")
+
+    click.echo("=" * 60)
+
+
+def _ensure_act_config() -> None:
+    """Create act config file with medium image if it doesn't exist.
+
+    Prevents act from prompting interactively on first run.
+    """
+    if sys.platform == "win32":
+        actrc = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "act" / "actrc"
+    elif sys.platform == "darwin":
+        actrc = Path.home() / "Library" / "Application Support" / "act" / "actrc"
+    else:
+        xdg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        actrc = xdg / "act" / "actrc"
+
+    if actrc.exists():
+        return
+
+    actrc.parent.mkdir(parents=True, exist_ok=True)
+    # Medium image: ~500MB, compatible with most actions
+    actrc.write_text(
+        "-P ubuntu-latest=catthehacker/ubuntu:act-latest\n"
+        "-P ubuntu-22.04=catthehacker/ubuntu:act-22.04\n"
+        "-P ubuntu-20.04=catthehacker/ubuntu:act-20.04\n"
+    )
+    click.echo(f"Created act config at {actrc} (using medium runner images).")
 
 
 def _resolve_key_path(config: dict, creds: dict | None = None) -> Path:
@@ -507,6 +615,234 @@ def swe_reset(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     click.echo(f"\n{msg}")
+
+
+@swe.command("test")
+@click.argument("problem_id")
+@click.option("--user-id", default=None, help="Override configured user ID.")
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Overrides configured/cached value.",
+)
+@click.option(
+    "-W", "workflow", default=None,
+    help="Path to a specific workflow file relative to .github/workflows/. "
+         "If omitted, act runs all workflows.",
+)
+@click.option(
+    "--act-args", default=None,
+    help="Additional arguments to pass to act (e.g. '--container-architecture linux/amd64').",
+)
+def swe_test(problem_id: str, user_id: str | None, workspace_dir: str | None,
+             workflow: str | None, act_args: str | None):
+    """Run the SWE-bench evaluation tests locally using nektos/act.
+
+    Executes the GitHub Actions workflow from the problem repository on your
+    local machine via 'act' (https://github.com/nektos/act), which requires
+    Docker to be running.
+
+    \b
+    PREREQUISITES:
+      1. Docker must be installed and running.
+         Install: https://docs.docker.com/get-docker/
+      2. 'act' must be installed.
+         Install: https://github.com/nektos/act#installation
+           macOS:   brew install act
+           Linux:   curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
+      3. You must have fetched the problem first with 'aicodinggym swe fetch'.
+
+    \b
+    ARGUMENTS:
+      PROBLEM_ID  The problem identifier you fetched earlier.
+
+    \b
+    WHAT IT DOES:
+      1. Checks that Docker and act are installed
+      2. Locates the .github/workflows/ directory in the problem repo
+      3. Runs 'act' to execute the evaluation workflow locally
+      4. Streams test output to your terminal
+
+    \b
+    EXAMPLE:
+      aicodinggym swe test django-11400
+      aicodinggym swe test django-11400 -W test_patch.yml
+      aicodinggym swe test django-11400 --act-args '--container-architecture linux/amd64'
+    """
+    config = load_config()
+    uid = _resolve_user_id(config, user_id)
+
+    credentials = load_credentials()
+    if problem_id not in credentials:
+        _error(
+            f"No credentials found for '{problem_id}'.\n\n"
+            f"You must fetch the problem first:\n"
+            f"  aicodinggym swe fetch {problem_id}"
+        )
+
+    creds = credentials[problem_id]
+
+    if creds.get("user_id") and creds["user_id"] != uid:
+        _error(f"User ID mismatch. Problem was fetched by '{creds['user_id']}', not '{uid}'.")
+
+    workspace = _resolve_workspace(config, workspace_dir or creds.get("workspace_dir"))
+    problem_dir = workspace / problem_id
+
+    if not problem_dir.exists():
+        _error(
+            f"Problem directory not found at: {problem_dir}\n\n"
+            f"You must fetch the problem first:\n"
+            f"  aicodinggym swe fetch {problem_id}"
+        )
+
+    # ── Check dependencies ──────────────────────────────────────────────
+    if not check_tool_installed("docker"):
+        _error(
+            "Docker is not installed or not on PATH.\n\n"
+            "act requires Docker to run GitHub Actions workflows locally.\n\n"
+            "Install Docker:\n"
+            "  macOS / Windows: https://docs.docker.com/get-docker/\n"
+            "  Ubuntu/Debian:   sudo apt-get install docker.io\n"
+            "  Fedora:          sudo dnf install docker\n\n"
+            "After installing, make sure the Docker daemon is running."
+        )
+
+    # Check Docker daemon is actually running
+    try:
+        docker_check = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10,
+        )
+        docker_running = docker_check.returncode == 0
+    except subprocess.TimeoutExpired:
+        docker_running = False
+    if not docker_running:
+        _error(
+            "Docker is installed but the daemon is not running.\n\n"
+            "Start Docker:\n"
+            "  macOS:     open -a Docker\n"
+            "  Windows:   Start Docker Desktop from the Start menu\n"
+            "  Linux:     sudo systemctl start docker\n\n"
+            "Wait a few seconds for it to start, then run this command again."
+        )
+
+    if not check_tool_installed("act"):
+        _error(
+            "'act' is not installed or not on PATH.\n\n"
+            "act lets you run GitHub Actions workflows locally using Docker.\n"
+            "https://github.com/nektos/act\n\n"
+            "Install act:\n"
+            "  macOS:     brew install act\n"
+            "  Windows:   choco install act-cli  OR  winget install nektos.act\n"
+            "  Linux:     curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash\n"
+            "  Other:     https://github.com/nektos/act#installation\n\n"
+            "After installing, run this command again."
+        )
+
+    # ── Ensure act config exists (avoids interactive prompt) ────────────
+    _ensure_act_config()
+
+    # ── Verify .github/workflows exists ─────────────────────────────────
+    workflows_dir = problem_dir / ".github" / "workflows"
+    if not workflows_dir.exists() or not any(workflows_dir.iterdir()):
+        _error(
+            f"No GitHub Actions workflows found at: {workflows_dir}\n\n"
+            "The repository may not include evaluation workflows.\n"
+            "Try re-fetching the problem:\n"
+            f"  aicodinggym swe fetch {problem_id}"
+        )
+
+    # ── Build act command ───────────────────────────────────────────────
+    act_cmd = ["act"]
+    if workflow:
+        act_cmd += ["-W", f".github/workflows/{workflow}"]
+
+    # Auto-detect Apple Silicon: check if workflow needs x86_64 emulation
+    if platform.machine() == "arm64" and (
+        not act_args or "--container-architecture" not in act_args
+    ):
+        needs_amd64 = False
+        for wf_file in workflows_dir.iterdir():
+            content = wf_file.read_text()
+            # Workflows with old Python, x86_64 conda packages, or
+            # platform-specific binaries need amd64 emulation
+            if re.search(r"python.*(3\.[56789]|2\.7)|libgcc|linux-64|linux_x86_64", content):
+                needs_amd64 = True
+                break
+        if needs_amd64:
+            click.echo(
+                "Note: Detected x86_64-specific dependencies in workflow.\n"
+                "      Running with --container-architecture linux/amd64 (slower on Apple Silicon).\n"
+                "      Override with: --act-args '--container-architecture linux/arm64'\n"
+            )
+            act_cmd += ["--container-architecture", "linux/amd64"]
+
+    if act_args:
+        act_cmd += act_args.split()
+
+    workflow_label = workflow or "all workflows"
+    click.echo(f"Running local tests for '{problem_id}' ({workflow_label})...")
+    click.echo(f"Command: {' '.join(act_cmd)}\n")
+
+    # ── Run act (filter output, show detail only for test steps) ────────
+    import time
+    start_time = time.monotonic()
+    output_lines: list[str] = []
+    current_step = ""
+    try:
+        proc = subprocess.Popen(
+            act_cmd, cwd=str(problem_dir),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        for line in proc.stdout:
+            output_lines.append(line)
+            stripped = line.rstrip()
+
+            # Step start: ⭐ Run <step name>
+            step_start = re.search(r"⭐\s+Run\s+(.+)", stripped)
+            if step_start:
+                current_step = step_start.group(1).strip()
+                click.echo(stripped)
+                continue
+
+            # Step result: ✅ Success / ❌ Failure
+            if re.search(r"(✅\s+Success|❌\s+Failure)", stripped):
+                click.echo(stripped)
+                continue
+
+            # Container lifecycle / job status / errors
+            if re.search(r"(🚀|🏁|level=|Error response)", stripped):
+                click.echo(stripped)
+                continue
+
+            # Detailed output (| ...) — only for specific steps
+            if re.search(r"\|\s+", stripped):
+                if "Apply Test Patch" in current_step:
+                    click.echo(stripped)
+                elif "Run Tests" in current_step:
+                    # Only show test results, errors, tracebacks — skip DB setup noise
+                    if re.search(
+                        r"\.\.\.\s+(ok|FAIL|ERROR)"
+                        r"|^.*\|\s+(FAIL|ERROR|OK|FAILED|Running \w+_TO_\w+:|Ran \d+)"
+                        r"|^.*\|\s+(Traceback|File |AssertionError|ImportError|ModuleNotFoundError)"
+                        r"|^.*\|\s+[-=]{10,}",
+                        stripped,
+                    ):
+                        click.echo(stripped)
+
+        proc.wait()
+    except FileNotFoundError:
+        _error("Failed to execute 'act'. Make sure it is installed and on your PATH.")
+    except KeyboardInterrupt:
+        proc.kill()
+        click.echo("\nTest run interrupted.")
+        sys.exit(130)
+
+    # ── Parse and display summary ───────────────────────────────────────
+    elapsed = time.monotonic() - start_time
+    _print_test_summary(output_lines, problem_id, proc.returncode, elapsed)
+
+    if proc.returncode != 0:
+        sys.exit(proc.returncode)
 
 
 # ── mle group ────────────────────────────────────────────────────────────────

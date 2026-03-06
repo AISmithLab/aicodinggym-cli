@@ -14,9 +14,10 @@ Supports two benchmarks: **SWE-bench** (code bug fixes) and **MLE-bench** (ML co
 # 1. Configure (one-time setup)
 aicodinggym configure --user-id YOUR_USER_ID
 
-# 2. SWE-bench: fetch, solve, submit
+# 2. SWE-bench: fetch, solve, test, submit
 aicodinggym swe fetch django__django-10097
 # ... edit code to fix the issue ...
+aicodinggym swe test django__django-10097    # run tests locally (requires Docker + act)
 aicodinggym swe submit django__django-10097
 
 # 3. MLE-bench: download, train, submit
@@ -66,6 +67,32 @@ aicodinggym swe submit PROBLEM_ID [--message MSG] [--force] [--user-id ID] [--wo
 |---|---|
 | `--message, -m` | Commit message (auto-generated if omitted) |
 | `--force` | Force push with `--force-with-lease` |
+
+#### `aicodinggym swe test PROBLEM_ID`
+
+Run the SWE-bench evaluation tests locally using [nektos/act](https://github.com/nektos/act).
+Executes the GitHub Actions workflow from the problem repo on your machine via Docker.
+
+```
+aicodinggym swe test PROBLEM_ID [-W WORKFLOW] [--act-args ARGS] [--user-id ID] [--workspace-dir DIR]
+```
+
+| Option | Description |
+|---|---|
+| `-W` | Specific workflow file in `.github/workflows/` (default: all) |
+| `--act-args` | Extra arguments passed to `act` (e.g. `'--container-architecture linux/amd64'`) |
+
+**Prerequisites:**
+- **Docker** — must be installed and running ([install](https://docs.docker.com/get-docker/))
+- **act** — must be installed ([install](https://github.com/nektos/act#installation))
+  - macOS: `brew install act`
+  - Windows: `choco install act-cli` or `winget install nektos.act`
+  - Linux: `curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash`
+
+**Notes:**
+- On Apple Silicon, x86_64 emulation is auto-enabled when the workflow requires it (e.g. old Python or platform-specific conda packages). This adds overhead (~4-5 min vs ~2.5 min on native x86_64).
+- Output is filtered to show step progress and test results only. Full setup logs (conda, pip) are suppressed.
+- A test summary with pass/fail status and elapsed time is printed at the end.
 
 #### `aicodinggym swe reset PROBLEM_ID`
 
