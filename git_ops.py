@@ -83,6 +83,50 @@ def clone_repo(repo_url: str, branch: str, dest_name: str,
     return True, f"Cloned to: {problem_dir}\nBranch: {branch}"
 
 
+def clone_repo_cr(repo_url: str, base_branch: str, head_branch: str,
+                  dest_name: str, workspace: str,
+                  key_path: Optional[Path] = None) -> tuple[bool, str]:
+    """Clone a code review repo with both base and head branches.
+
+    Clones the base branch first (shallow), then fetches the head branch.
+    Returns (success, message).
+    """
+    problem_dir = Path(workspace) / dest_name
+
+    if problem_dir.exists():
+        # Already cloned — fetch latest for both branches
+        for branch in (base_branch, head_branch):
+            result = run_git_command(f"git fetch origin {branch}", str(problem_dir), key_path)
+            if result.returncode != 0:
+                return False, f"Git fetch failed for {branch}:\n{result.stderr}"
+            run_git_command(f"git branch -f {branch} FETCH_HEAD", str(problem_dir))
+        return True, (
+            f"Already exists. Updated both branches.\n"
+            f"Repository: {problem_dir}\n"
+            f"Branches: {base_branch}, {head_branch}"
+        )
+
+    # Clone base branch (shallow)
+    cmd = f"git clone --single-branch --branch {base_branch} --depth 50 {repo_url} {dest_name}"
+    result = run_git_command(cmd, workspace, key_path)
+    if result.returncode != 0:
+        return False, f"Git clone failed:\n{result.stderr}"
+
+    # Fetch head branch
+    fetch_cmd = f"git fetch origin {head_branch}"
+    result = run_git_command(fetch_cmd, str(problem_dir), key_path)
+    if result.returncode != 0:
+        return False, f"Failed to fetch head branch '{head_branch}':\n{result.stderr}"
+
+    # Create local head branch tracking the fetched ref
+    run_git_command(f"git branch {head_branch} FETCH_HEAD", str(problem_dir))
+
+    return True, (
+        f"Cloned to: {problem_dir}\n"
+        f"Branches: {base_branch}, {head_branch}"
+    )
+
+
 def add_commit_push(problem_dir: str, branch: str, key_path: Path,
                     message: str, force: bool = False) -> tuple[bool, str, str]:
     """Stage, commit, and push changes.
