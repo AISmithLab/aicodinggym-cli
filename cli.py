@@ -860,9 +860,8 @@ def cr():
 
     \b
     WORKFLOW:
-      1. aicodinggym cr submit CR_PROBLEM_ID -f review.md
-      2. aicodinggym cr submit CR_PROBLEM_ID -m "Found a bug in line 42"
-      3. echo "review text" | aicodinggym cr submit CR_PROBLEM_ID
+      1. aicodinggym cr fetch CR_PROBLEM_ID            # Clone repo with base/head branches
+      2. aicodinggym cr submit CR_PROBLEM_ID -f review.md   # Submit your review
     """
     pass
 
@@ -902,7 +901,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     head_branch = data.get("head_branch")
     repo_url = data.get("repo_url")
 
-    if not repo_url or not base_branch or not head_branch:
+    if not (repo_url and repo_url.strip()) or not (base_branch and base_branch.strip()) or not (head_branch and head_branch.strip()):
         _error("Server did not return required fields (repo_url, base_branch, head_branch).")
 
     # Save credentials for later submit
