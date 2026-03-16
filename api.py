@@ -86,6 +86,11 @@ def submit_notification(problem_id: str, user_id: str, commit_hash: str,
     })
 
 
+def fetch_pr(user_id: str, problem_id: str) -> dict:
+    """Fetch CR problem info. Returns {'base_branch': ..., 'head_branch': ..., 'repo_url': ...}."""
+    return _post("code-review-fetch", {"user_id": user_id, "problem_id": problem_id})
+
+
 def cr_submit_review(user_id: str, problem_id: str, review: str) -> dict:
     """Submit a code review."""
     return _post("code-review-submit", {
