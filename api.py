@@ -1,8 +1,10 @@
 """HTTP API client for the AI Coding Gym backend at aicodinggym.com."""
 
+import os
+
 import requests
 
-API_BASE = "https://aicodinggym.com/api"
+API_BASE = os.environ.get("AICODINGGYM_API_BASE", "https://aicodinggym.com/api")
 TIMEOUT = 30
 
 
@@ -81,6 +83,15 @@ def submit_notification(problem_id: str, user_id: str, commit_hash: str,
         "branch": branch,
         "commit_message": commit_message,
         "timestamp": timestamp,
+    })
+
+
+def cr_submit_review(user_id: str, problem_id: str, review: str) -> dict:
+    """Submit a code review."""
+    return _post("code-review-submit", {
+        "user_id": user_id,
+        "problem_id": problem_id,
+        "review": review,
     })
 
 
