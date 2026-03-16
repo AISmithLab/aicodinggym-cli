@@ -1,12 +1,19 @@
 """Git and SSH key operations for AI Coding Gym CLI."""
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 from .config import ensure_config_dir
+
+
+def _validate_git_ref(name: str, label: str) -> None:
+    """Raise ValueError if name contains suspicious shell metacharacters."""
+    if re.search(r'[;&|`$(){}]', name):
+        raise ValueError(f"Invalid {label}: {name!r}")
 
 
 def generate_ssh_key_pair(user_id: str) -> tuple[Path, str]:
@@ -81,6 +88,59 @@ def clone_repo(repo_url: str, branch: str, dest_name: str,
         return False, f"Git clone failed:\n{result.stderr}\nMake sure the branch '{branch}' exists in the repository."
 
     return True, f"Cloned to: {problem_dir}\nBranch: {branch}"
+
+
+def clone_repo_cr(repo_url: str, base_branch: str, head_branch: str,
+                  dest_name: str, workspace: str,
+                  key_path: Optional[Path] = None) -> tuple[bool, str]:
+    """Clone a code review repo with both base and head branches.
+
+    Clones the base branch first (shallow), then fetches the head branch.
+    Returns (success, message).
+    """
+    _validate_git_ref(base_branch, "base_branch")
+    _validate_git_ref(head_branch, "head_branch")
+    _validate_git_ref(repo_url, "repo_url")
+    _validate_git_ref(dest_name, "dest_name")
+
+    problem_dir = Path(workspace) / dest_name
+
+    if problem_dir.exists():
+        # Already cloned — fetch latest for both branches
+        for branch in (base_branch, head_branch):
+            result = run_git_command(f"git fetch origin {branch}", str(problem_dir), key_path)
+            if result.returncode != 0:
+                return False, f"Git fetch failed for {branch}:\n{result.stderr}"
+            result = run_git_command(f"git branch -f {branch} FETCH_HEAD", str(problem_dir))
+            if result.returncode != 0:
+                return False, f"Failed to update branch {branch}:\n{result.stderr}"
+        return True, (
+            f"Already exists. Updated both branches.\n"
+            f"Repository: {problem_dir}\n"
+            f"Branches: {base_branch}, {head_branch}"
+        )
+
+    # Clone base branch (shallow); depth 50 needed for diffing between branches
+    cmd = f"git clone --single-branch --branch {base_branch} --depth 50 {repo_url} {dest_name}"
+    result = run_git_command(cmd, workspace, key_path)
+    if result.returncode != 0:
+        return False, f"Git clone failed:\n{result.stderr}"
+
+    # Fetch head branch
+    fetch_cmd = f"git fetch origin {head_branch}"
+    result = run_git_command(fetch_cmd, str(problem_dir), key_path)
+    if result.returncode != 0:
+        return False, f"Failed to fetch head branch '{head_branch}':\n{result.stderr}"
+
+    # Create local head branch tracking the fetched ref
+    result = run_git_command(f"git branch -f {head_branch} FETCH_HEAD", str(problem_dir))
+    if result.returncode != 0:
+        return False, f"Failed to create branch {head_branch}:\n{result.stderr}"
+
+    return True, (
+        f"Cloned to: {problem_dir}\n"
+        f"Branches: {base_branch}, {head_branch}"
+    )
 
 
 def add_commit_push(problem_dir: str, branch: str, key_path: Path,

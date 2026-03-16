@@ -31,6 +31,7 @@ from . import __version__
 from .api import (
     APIError,
     configure as api_configure,
+    cr_submit_review,
     fetch_problem as api_fetch_problem,
     mlebench_download_file,
     mlebench_download_info,
@@ -47,6 +48,7 @@ from .git_ops import (
     add_commit_push,
     check_tool_installed,
     clone_repo,
+    clone_repo_cr,
     generate_ssh_key_pair,
     reset_to_setup_commit,
 )
@@ -843,6 +845,159 @@ def swe_test(problem_id: str, user_id: str | None, workspace_dir: str | None,
 
     if proc.returncode != 0:
         sys.exit(proc.returncode)
+
+
+# ── cr group ──────────────────────────────────────────────────────────────────
+
+
+@main.group()
+def cr():
+    """Code Review challenges - submit reviews for code diffs.
+
+    \b
+    PREREQUISITE:
+      Run 'aicodinggym configure --user-id YOUR_USER_ID' before using these commands.
+
+    \b
+    WORKFLOW:
+      1. aicodinggym cr fetch CR_PROBLEM_ID            # Clone repo with base/head branches
+      2. aicodinggym cr submit CR_PROBLEM_ID -f review.md   # Submit your review
+    """
+    pass
+
+
+@cr.command("fetch")
+@click.argument("problem_id")
+@click.option("--user-id", default=None, help="Override configured user ID.")
+@click.option("--workspace-dir", default=None, type=click.Path(),
+              help="Directory to clone into. Overrides configured workspace.")
+def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
+    """Fetch a Code Review problem repo with base and head branches.
+
+    Clones the Problemset-CodeReview repository and checks out both the
+    base and head branches so you can diff them locally.
+
+    \b
+    ARGUMENTS:
+      PROBLEM_ID  The code review problem identifier (e.g., 'cr/sentry-0001').
+
+    \b
+    EXAMPLE:
+      aicodinggym cr fetch cr/sentry-0001
+      cd <workspace>/cr/sentry-0001
+      git diff sentry-0001/base..sentry-0001/head
+    """
+    config = load_config()
+    uid = _resolve_user_id(config, user_id)
+    workspace = _resolve_workspace(config, workspace_dir)
+
+    try:
+        click.echo(f"Fetching problem '{problem_id}' from server...")
+        data = api_fetch_problem(uid, problem_id)
+    except APIError as e:
+        _error(str(e))
+
+    base_branch = data.get("base_branch")
+    head_branch = data.get("head_branch")
+    repo_url = data.get("repo_url")
+
+    if not (repo_url and repo_url.strip()) or not (base_branch and base_branch.strip()) or not (head_branch and head_branch.strip()):
+        _error("Server did not return required fields (repo_url, base_branch, head_branch).")
+
+    # Save credentials for later submit
+    credentials = load_credentials()
+    credentials[problem_id] = {
+        "repo_url": repo_url,
+        "base_branch": base_branch,
+        "head_branch": head_branch,
+        "user_id": uid,
+        "workspace_dir": str(workspace),
+        "benchmark": "cr",
+    }
+    save_credentials(credentials)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Cloning into {workspace / problem_id}...")
+    success, msg = clone_repo_cr(repo_url, base_branch, head_branch,
+                                  problem_id, str(workspace))
+    if not success:
+        _error(msg)
+
+    click.echo(
+        f"\nSuccessfully fetched: {problem_id}\n"
+        f"\n"
+        f"  {msg}\n"
+        f"\n"
+        f"To see the diff:\n"
+        f"  cd {workspace / problem_id}\n"
+        f"  git diff {base_branch}..{head_branch}\n"
+    )
+
+
+@cr.command("submit")
+@click.argument("problem_id")
+@click.option("--user-id", default=None, help="Override configured user ID.")
+@click.option(
+    "-f", "--file", "review_file", type=click.Path(exists=True),
+    help="Path to a file containing your review.",
+)
+@click.option(
+    "-m", "--message", "review_text",
+    help="Inline review text.",
+)
+def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
+              review_text: str | None):
+    """Submit a code review for a Code Review challenge.
+
+    Reads your review from a file (-f), inline text (-m), or piped stdin,
+    and submits it to the AI Coding Gym server.
+
+    \b
+    ARGUMENTS:
+      PROBLEM_ID  The code review problem identifier (e.g., 'cr/sentry-0001').
+
+    \b
+    EXAMPLE:
+      aicodinggym cr submit cr/sentry-0001 -f review.md
+      aicodinggym cr submit cr/sentry-0001 -m "Found a null pointer bug on line 42"
+      echo "My review" | aicodinggym cr submit cr/sentry-0001
+    """
+    config = load_config()
+    uid = _resolve_user_id(config, user_id)
+
+    # Collect review text (priority: -f > -m > stdin)
+    review = None
+    if review_file:
+        review = Path(review_file).read_text()
+    elif review_text:
+        review = review_text
+    elif not sys.stdin.isatty():
+        review = sys.stdin.read()
+
+    if not review or not review.strip():
+        _error(
+            "No review text provided.\n\n"
+            "Provide your review using one of:\n"
+            "  -f <file>       Read review from a file\n"
+            "  -m \"text\"       Inline review text\n"
+            "  echo ... | ...  Pipe from stdin\n\n"
+            "Example:\n"
+            f"  aicodinggym cr submit {problem_id} -f review.md"
+        )
+
+    try:
+        result = cr_submit_review(uid, problem_id, review.strip())
+    except APIError as e:
+        _error(str(e))
+
+    click.echo(
+        f"\nSuccessfully submitted code review for {problem_id}\n"
+        f"\n"
+        f"  Status:  {result.get('status', 'COMPLETED')}\n"
+        f"\n"
+        f"View results at: https://aicodinggym.com/challenge/{problem_id}"
+    )
 
 
 # ── mle group ────────────────────────────────────────────────────────────────
