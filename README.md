@@ -1,7 +1,7 @@
 # aicodinggym-cli
 
 CLI tool for the [AI Coding Gym](https://aicodinggym.com) platform.
-Supports two benchmarks: **SWE-bench** (code bug fixes) and **MLE-bench** (ML competitions).
+Supports three benchmarks: **SWE-bench** (code bug fixes), **MLE-bench** (ML competitions), and **Code Review** challenges.
 
 **Install:** `pip install aicodinggym-cli`
 **Entry point:** `aicodinggym`
@@ -24,6 +24,11 @@ aicodinggym swe submit django__django-10097
 aicodinggym mle download spaceship-titanic
 # ... train model, generate predictions ...
 aicodinggym mle submit spaceship-titanic -F predictions.csv
+
+# 4. Code Review: fetch, review, submit
+aicodinggym cr fetch keycloak-0008
+# ... read diff.patch, write your review in review.md ...
+aicodinggym cr submit keycloak-0008 -f review.md
 ```
 
 ---
@@ -132,6 +137,38 @@ aicodinggym mle submit COMPETITION_ID -F FILE [--user-id ID] [--message MSG]
 |---|---|---|
 | `-F` | Yes | Path to prediction CSV file |
 | `--message, -m` | No | Submission description |
+
+---
+
+### `aicodinggym cr` — Code Review Commands
+
+#### `aicodinggym cr fetch PROBLEM_ID`
+
+Download the PR diff and create a `review.md` template.
+
+```
+aicodinggym cr fetch PROBLEM_ID [--user-id ID] [--workspace-dir DIR]
+```
+
+Creates in `<workspace>/<problem_id>/`:
+- `diff.patch` — the full diff between base and head branches
+- `review.md` — template to fill in your review (only created if not already present)
+
+#### `aicodinggym cr submit PROBLEM_ID`
+
+Submit your code review.
+
+```
+aicodinggym cr submit PROBLEM_ID -f review.md [--user-id ID]
+aicodinggym cr submit PROBLEM_ID -m "Inline review text"
+echo "My review" | aicodinggym cr submit PROBLEM_ID
+```
+
+| Option | Description |
+|---|---|
+| `-f, --file` | Path to a file containing your review (e.g. `review.md`) |
+| `-m, --message` | Inline review text |
+| stdin | Pipe review text from stdin |
 
 ---
 

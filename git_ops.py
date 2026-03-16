@@ -114,6 +114,9 @@ def clone_repo_cr(repo_url: str, base_branch: str, head_branch: str,
             result = run_git_command(f"git branch -f {branch} FETCH_HEAD", str(problem_dir))
             if result.returncode != 0:
                 return False, f"Failed to update branch {branch}:\n{result.stderr}"
+        result = run_git_command(f"git checkout {head_branch}", str(problem_dir))
+        if result.returncode != 0:
+            return False, f"Failed to checkout head branch '{head_branch}':\n{result.stderr}"
         return True, (
             f"Already exists. Updated both branches.\n"
             f"Repository: {problem_dir}\n"
@@ -136,6 +139,11 @@ def clone_repo_cr(repo_url: str, base_branch: str, head_branch: str,
     result = run_git_command(f"git branch -f {head_branch} FETCH_HEAD", str(problem_dir))
     if result.returncode != 0:
         return False, f"Failed to create branch {head_branch}:\n{result.stderr}"
+
+    # Check out head branch so the user starts on the code being reviewed
+    result = run_git_command(f"git checkout {head_branch}", str(problem_dir))
+    if result.returncode != 0:
+        return False, f"Failed to checkout head branch '{head_branch}':\n{result.stderr}"
 
     return True, (
         f"Cloned to: {problem_dir}\n"

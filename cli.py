@@ -1,7 +1,7 @@
 """AI Coding Gym CLI - main entry point.
 
 A command-line tool for the AI Coding Gym platform (https://aicodinggym.com).
-Supports SWE-bench and MLE-bench challenges.
+Supports SWE-bench, MLE-bench, and Code Review challenges.
 
 SETUP (required before any other command):
     aicodinggym configure --user-id YOUR_USER_ID
@@ -15,6 +15,11 @@ MLE-BENCH WORKFLOW:
     aicodinggym mle download spaceship-titanic
     # ... train model, generate predictions ...
     aicodinggym mle submit spaceship-titanic -F submission.csv
+
+CODE REVIEW WORKFLOW:
+    aicodinggym cr fetch sentry-0001
+    # ... review the diff and write your review ...
+    aicodinggym cr submit sentry-0001 -f review.md
 """
 
 import os
@@ -32,6 +37,7 @@ from .api import (
     APIError,
     configure as api_configure,
     cr_submit_review,
+    fetch_pr as api_fetch_pr,
     fetch_problem as api_fetch_problem,
     mlebench_download_file,
     mlebench_download_info,
@@ -51,7 +57,14 @@ from .git_ops import (
     clone_repo_cr,
     generate_ssh_key_pair,
     reset_to_setup_commit,
+    run_git_command,
 )
+
+
+def _hyperlink(url: str, text: str | None = None) -> str:
+    """Return an OSC 8 terminal hyperlink. Falls back to plain URL on unsupported terminals."""
+    label = text or url
+    return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
 
 
 def _error(msg: str) -> None:
@@ -230,7 +243,9 @@ def _resolve_key_path(config: dict, creds: dict | None = None) -> Path:
         "  aicodinggym swe fetch django__django-10097\n"
         "  aicodinggym swe submit django__django-10097 --message 'Fix auth bug'\n"
         "  aicodinggym mle download spaceship-titanic\n"
-        "  aicodinggym mle submit spaceship-titanic -F predictions.csv\n\n"
+        "  aicodinggym mle submit spaceship-titanic -F predictions.csv\n"
+        "  aicodinggym cr fetch sentry-0001\n"
+        "  aicodinggym cr submit sentry-0001 -f review.md\n\n"
         "\b\n"
         "WEBSITE:\n"
         "  https://aicodinggym.com\n"
@@ -328,7 +343,7 @@ def configure(user_id: str, workspace_dir: str | None):
             f"  SSH Key:     {private_key_path}\n"
             f"  Config:      ~/.aicodinggym/config.json\n"
             f"\n"
-            f"You can now use 'aicodinggym swe' and 'aicodinggym mle' commands."
+            f"You can now use 'aicodinggym swe', 'aicodinggym mle', and 'aicodinggym cr' commands."
         )
     except APIError as e:
         _error(str(e))
@@ -550,7 +565,7 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
         f"  Branch:  {branch}\n"
         f"  Status:  Pushed and backend notified\n"
         f"\n"
-        f"Your solution has been submitted for evaluation!"
+        f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/swe/{problem_id}')}"
     )
 
 
@@ -860,8 +875,9 @@ def cr():
 
     \b
     WORKFLOW:
-      1. aicodinggym cr fetch CR_PROBLEM_ID            # Clone repo with base/head branches
-      2. aicodinggym cr submit CR_PROBLEM_ID -f review.md   # Submit your review
+      1. aicodinggym cr fetch CR_PROBLEM_ID             # Download diff + create review.md
+      2. (edit review.md with your findings)
+      3. aicodinggym cr submit CR_PROBLEM_ID -f review.md   # Submit your review
     """
     pass
 
@@ -872,20 +888,20 @@ def cr():
 @click.option("--workspace-dir", default=None, type=click.Path(),
               help="Directory to clone into. Overrides configured workspace.")
 def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
-    """Fetch a Code Review problem repo with base and head branches.
+    """Fetch a Code Review problem: downloads the PR diff and creates a review template.
 
-    Clones the Problemset-CodeReview repository and checks out both the
-    base and head branches so you can diff them locally.
+    Clones the repository, generates diff.patch from base→head, and creates
+    review.md as a template to fill in your review.
 
     \b
     ARGUMENTS:
-      PROBLEM_ID  The code review problem identifier (e.g., 'cr/sentry-0001').
+      PROBLEM_ID  The code review problem identifier (e.g., 'keycloak-0008').
 
     \b
     EXAMPLE:
-      aicodinggym cr fetch cr/sentry-0001
-      cd <workspace>/cr/sentry-0001
-      git diff sentry-0001/base..sentry-0001/head
+      aicodinggym cr fetch keycloak-0008
+      # Edit review.md in the problem directory, then:
+      aicodinggym cr submit keycloak-0008 -f review.md
     """
     config = load_config()
     uid = _resolve_user_id(config, user_id)
@@ -893,7 +909,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
 
     try:
         click.echo(f"Fetching problem '{problem_id}' from server...")
-        data = api_fetch_problem(uid, problem_id)
+        data = api_fetch_pr(uid, problem_id)
     except APIError as e:
         _error(str(e))
 
@@ -924,14 +940,40 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
+    problem_dir = workspace / problem_id
+
+    # Generate diff.patch
+    diff_result = run_git_command(
+        f"git diff {base_branch}..{head_branch}", str(problem_dir)
+    )
+    diff_path = problem_dir / "diff.patch"
+    diff_path.write_text(diff_result.stdout)
+
+    # Create review.md template if it doesn't exist yet
+    review_path = problem_dir / "review.md"
+    if not review_path.exists():
+        review_path.write_text(
+            f"# Code Review: {problem_id}\n\n"
+            "## Summary\n\n"
+            "<!-- Brief summary of what this PR does -->\n\n"
+            "## Issues Found\n\n"
+            "<!-- List bugs, logic errors, security issues, etc. -->\n\n"
+            "## Suggestions\n\n"
+            "<!-- Optional improvements, style notes, etc. -->\n\n"
+            "## Verdict\n\n"
+            "<!-- Approve / Request Changes / Comment -->\n"
+        )
+
     click.echo(
         f"\nSuccessfully fetched: {problem_id}\n"
         f"\n"
-        f"  {msg}\n"
+        f"  Diff saved to:     {diff_path}\n"
+        f"  Review template:   {review_path}\n"
         f"\n"
-        f"To see the diff:\n"
-        f"  cd {workspace / problem_id}\n"
-        f"  git diff {base_branch}..{head_branch}\n"
+        f"Next steps:\n"
+        f"  1. Review the diff:  cat {diff_path}\n"
+        f"  2. Write your review in {review_path}\n"
+        f"  3. Submit:  aicodinggym cr submit {problem_id} -f review.md\n"
     )
 
 
@@ -955,13 +997,13 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
 
     \b
     ARGUMENTS:
-      PROBLEM_ID  The code review problem identifier (e.g., 'cr/sentry-0001').
+      PROBLEM_ID  The code review problem identifier (e.g., 'sentry-0001').
 
     \b
     EXAMPLE:
-      aicodinggym cr submit cr/sentry-0001 -f review.md
-      aicodinggym cr submit cr/sentry-0001 -m "Found a null pointer bug on line 42"
-      echo "My review" | aicodinggym cr submit cr/sentry-0001
+      aicodinggym cr submit sentry-0001 -f review.md
+      aicodinggym cr submit sentry-0001 -m "Found a null pointer bug on line 42"
+      echo "My review" | aicodinggym cr submit sentry-0001
     """
     config = load_config()
     uid = _resolve_user_id(config, user_id)
@@ -996,7 +1038,7 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
         f"\n"
         f"  Status:  {result.get('status', 'COMPLETED')}\n"
         f"\n"
-        f"View results at: https://aicodinggym.com/challenge/{problem_id}"
+        f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/cr/{problem_id}')}"
     )
 
 
@@ -1129,4 +1171,4 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     )
     if score is not None:
         click.echo(f"  Score:   {score}\n")
-    click.echo("Your prediction has been submitted for scoring!")
+    click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
