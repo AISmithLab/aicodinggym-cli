@@ -6,6 +6,9 @@ SSH keys are stored in ~/.aicodinggym/{user_id}_id_rsa.
 """
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +22,22 @@ _CONFIG_FIELDS = ("user_id", "repo_name", "private_key_path", "workspace_dir")
 
 
 def ensure_config_dir() -> Path:
-    """Create the config directory with secure permissions if it doesn't exist."""
-    CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
+    """Create the config directory with secure permissions if it doesn't exist.
+
+    On Unix/macOS: mode 0o700 (owner-only access).
+    On Windows: removes inherited ACLs and grants full control only to the
+    current user via icacls.
+    """
+    created = not CONFIG_DIR.exists()
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if created and sys.platform == "win32":
+        username = os.environ.get("USERNAME", "")
+        if username:
+            subprocess.run(
+                ["icacls", str(CONFIG_DIR), "/inheritance:r",
+                 "/grant:r", f"{username}:(OI)(CI)(F)"],
+                capture_output=True,
+            )
     return CONFIG_DIR
 
 
