@@ -11,6 +11,33 @@ from typing import Optional
 from .config import ensure_config_dir
 
 
+def _find_git_ssh() -> str | None:
+    """On Windows, find Git for Windows' bundled ssh.exe.
+
+    Windows may have two SSH binaries on PATH: the built-in OpenSSH
+    (C:\\Windows\\System32\\OpenSSH\\ssh.exe) and Git for Windows' MSYS2
+    ssh (C:\\Program Files\\Git\\usr\\bin\\ssh.exe).  System32 is usually
+    first on PATH, so an unqualified 'ssh' resolves to Windows OpenSSH,
+    which can trigger GUI credential dialogs or deadlock when stdout is
+    captured.  This function returns the full path to Git's bundled ssh
+    so we can reference it explicitly in GIT_SSH_COMMAND.
+    """
+    if sys.platform != "win32":
+        return None
+    git_path = shutil.which("git")
+    if not git_path:
+        return None
+    # Walk up from git.exe to find the Git root containing usr/bin/ssh.exe.
+    # Handles cmd/, bin/, and mingw64/bin/ layouts.
+    candidate = Path(git_path).resolve().parent
+    for _ in range(4):
+        ssh = candidate / "usr" / "bin" / "ssh.exe"
+        if ssh.exists():
+            return str(ssh).replace("\\", "/")
+        candidate = candidate.parent
+    return None
+
+
 def _validate_git_ref(name: str, label: str) -> None:
     """Raise ValueError if name contains suspicious shell metacharacters."""
     if re.search(r'[;&|`$(){}]', name):
@@ -91,15 +118,21 @@ def run_git_command(cmd: list[str], cwd: str, key_path: Optional[Path] = None) -
         # Quote the key path in case it contains spaces (common on Windows).
         # Use forward slashes — works on all platforms and avoids backslash escaping.
         quoted_key = str(key_path).replace("\\", "/")
+        # On Windows, use Git for Windows' bundled ssh to avoid Windows native
+        # OpenSSH which can trigger GUI credential dialogs or deadlock when
+        # stdout is captured.  Falls back to bare "ssh" if not found.
+        ssh_bin = _find_git_ssh() or "ssh"
         # Always use /dev/null for UserKnownHostsFile.  On macOS/Linux this is
         # the native null device.  On Windows, Git for Windows bundles MSYS2's
-        # ssh which translates /dev/null correctly; Windows-native OpenSSH also
-        # accepts /dev/null.  Using os.devnull ("nul") would break MSYS2's ssh
-        # which treats "nul" as a literal filename.
+        # ssh which translates /dev/null correctly.  Using os.devnull ("nul")
+        # would break MSYS2's ssh which treats "nul" as a literal filename.
+        # BatchMode=yes prevents any interactive prompts (password, passphrase)
+        # that would cause a hang when stdout/stderr are captured.
         env["GIT_SSH_COMMAND"] = (
-            f'ssh -i "{quoted_key}" '
+            f'"{ssh_bin}" -i "{quoted_key}" '
             f"-o StrictHostKeyChecking=no "
-            f"-o UserKnownHostsFile=/dev/null"
+            f"-o UserKnownHostsFile=/dev/null "
+            f"-o BatchMode=yes"
         )
 
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
