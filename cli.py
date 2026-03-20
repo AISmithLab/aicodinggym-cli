@@ -944,7 +944,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
 
     # Generate diff.patch
     diff_result = run_git_command(
-        f"git diff {base_branch}..{head_branch}", str(problem_dir)
+        ["git", "diff", f"{base_branch}..{head_branch}"], str(problem_dir)
     )
     diff_path = problem_dir / "diff.patch"
     diff_path.write_text(diff_result.stdout)
@@ -964,6 +964,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
             "<!-- Approve / Request Changes / Comment -->\n"
         )
 
+    cat_cmd = "type" if sys.platform == "win32" else "cat"
     click.echo(
         f"\nSuccessfully fetched: {problem_id}\n"
         f"\n"
@@ -971,7 +972,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         f"  Review template:   {review_path}\n"
         f"\n"
         f"Next steps:\n"
-        f"  1. Review the diff:  cat {diff_path}\n"
+        f"  1. Review the diff:  {cat_cmd} {diff_path}\n"
         f"  2. Write your review in {review_path}\n"
         f"  3. Submit:  aicodinggym cr submit {problem_id} -f review.md\n"
     )
