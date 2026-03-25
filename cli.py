@@ -22,11 +22,13 @@ CODE REVIEW WORKFLOW:
     aicodinggym cr submit sentry-0001 -f review.md
 """
 
+import json
 import os
 import platform
 import re
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -76,6 +78,81 @@ def _error(msg: str) -> None:
 def _warn(msg: str) -> None:
     """Print a warning message to stderr."""
     click.echo(f"Warning: {msg}", err=True)
+
+
+_GYM_ENV_API = "https://api.github.com/repos/AICodingGym/gym-environment/contents"
+_GYM_ENV_SKIP = {"README.md"}
+
+
+def _install_gym_environment(dest: Path) -> None:
+    """Download gym-environment files into dest and add them to .gitignore."""
+    try:
+        req = urllib.request.Request(_GYM_ENV_API, headers={"Accept": "application/vnd.github.v3+json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            entries = json.loads(resp.read())
+    except Exception as e:
+        _warn(f"Could not fetch gym-environment file list: {e}")
+        return
+
+    downloaded: list[str] = []
+
+    for entry in entries:
+        name = entry.get("name", "")
+        if name in _GYM_ENV_SKIP:
+            continue
+        etype = entry.get("type")
+
+        if etype == "file":
+            url = entry.get("download_url")
+            if not url:
+                continue
+            try:
+                with urllib.request.urlopen(url, timeout=15) as r:
+                    (dest / name).write_bytes(r.read())
+                downloaded.append(name)
+            except Exception as e:
+                _warn(f"Failed to download {name}: {e}")
+
+        elif etype == "dir":
+            # Fetch subdirectory contents recursively (one level deep)
+            try:
+                sub_req = urllib.request.Request(
+                    f"{_GYM_ENV_API}/{name}",
+                    headers={"Accept": "application/vnd.github.v3+json"},
+                )
+                with urllib.request.urlopen(sub_req, timeout=15) as r:
+                    sub_entries = json.loads(r.read())
+            except Exception as e:
+                _warn(f"Failed to list directory {name}: {e}")
+                continue
+
+            sub_dir = dest / name
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            for sub in sub_entries:
+                sub_name = sub.get("name", "")
+                sub_url = sub.get("download_url")
+                if sub.get("type") != "file" or not sub_url:
+                    continue
+                try:
+                    with urllib.request.urlopen(sub_url, timeout=15) as r:
+                        (sub_dir / sub_name).write_bytes(r.read())
+                except Exception as e:
+                    _warn(f"Failed to download {name}/{sub_name}: {e}")
+            downloaded.append(name)
+
+    if not downloaded:
+        return
+
+    # Append to .gitignore
+    gitignore = dest / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    existing_lines = set(existing.splitlines())
+    new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
+    if new_entries:
+        block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
+        with open(gitignore, "a") as fh:
+            fh.write(block)
+
 
 
 def _resolve_user_id(config: dict, user_id: str | None) -> str:
@@ -334,6 +411,8 @@ def configure(user_id: str, workspace_dir: str | None):
         }
         save_config(config)
 
+        _install_gym_environment(Path(resolved_workspace))
+
         click.echo(
             f"\nConfiguration saved successfully!\n"
             f"\n"
@@ -448,6 +527,8 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
 
     if not success:
         _error(msg)
+
+    _install_gym_environment(workspace / problem_id)
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -940,6 +1021,8 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
+    _install_gym_environment(workspace / problem_id)
+
     problem_dir = workspace / problem_id
 
     # Generate diff.patch
@@ -1098,6 +1181,8 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
         mlebench_download_info(uid, competition_id, str(dest_path))
     except APIError as e:
         _error(str(e))
+
+    _install_gym_environment(workspace / competition_id)
 
     click.echo(
         f"\nDataset downloaded to: {dest_path}\n"
