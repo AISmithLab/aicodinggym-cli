@@ -236,8 +236,12 @@ def add_commit_push(problem_dir: str, branch: str, key_path: Path,
     """
     pdir = Path(problem_dir)
 
-    # Stage all changes except .github
-    result = run_git_command(["git", "add", "-A", "--", ".", ":(exclude).github"], str(pdir))
+    # Stage all changes except dotfiles/dotdirs and markdown files
+    result = run_git_command([
+        "git", "add", "-A", "--", ".",
+        ":(exclude).*",
+        ":(exclude)*.md",
+    ], str(pdir))
     if result.returncode != 0:
         return False, f"Git add failed:\n{result.stderr}", ""
 
