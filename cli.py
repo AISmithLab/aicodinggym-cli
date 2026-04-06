@@ -145,12 +145,12 @@ def _install_gym_environment(dest: Path) -> None:
 
     # Append to .gitignore
     gitignore = dest / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     existing_lines = set(existing.splitlines())
     new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
     if new_entries:
         block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
-        with open(gitignore, "a") as fh:
+        with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(block)
 
 

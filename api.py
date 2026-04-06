@@ -1,6 +1,8 @@
 """HTTP API client for the AI Coding Gym backend at aicodinggym.com."""
 
+import gzip
 import os
+from pathlib import Path
 
 import requests
 
@@ -123,15 +125,17 @@ def mlebench_download_file(url: str, dest_path: str, timeout: int = 300) -> None
 def mlebench_submit_csv(user_id: str, competition_id: str, csv_path: str) -> dict:
     """Upload a prediction CSV for an MLE-bench competition."""
     try:
+        csv_name = Path(csv_path).name
         with open(csv_path, "rb") as f:
-            resp = requests.post(
-                f"{API_BASE}/competitions/{competition_id}/submit",
-                data={"user_id": user_id, "competition_id": competition_id},
-                files={"file": (f.name, f, "text/csv")},
-                timeout=60,
-            )
-            resp.raise_for_status()
-            return resp.json()
+            compressed = gzip.compress(f.read())
+        resp = requests.post(
+            f"{API_BASE}/competitions/{competition_id}/submit",
+            data={"user_id": user_id, "competition_id": competition_id},
+            files={"file": (csv_name + ".gz", compressed, "application/gzip")},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except requests.ConnectionError:
         raise APIError(
             f"Cannot connect to {API_BASE}.\n"
