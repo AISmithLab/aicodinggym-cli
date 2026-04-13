@@ -31,6 +31,7 @@ import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -52,6 +53,9 @@ from .config import (
     save_config,
     save_credentials,
 )
+from .experiment_log import ExperimentLog, LogEntry
+from .gym_logger import log_entry as gym_session_log_entry
+from .session_log import SessionLogger
 from .git_ops import (
     add_commit_push,
     check_tool_installed,
@@ -80,14 +84,28 @@ def _warn(msg: str) -> None:
     click.echo(f"Warning: {msg}", err=True)
 
 
-_GYM_ENV_API = "https://api.github.com/repos/AICodingGym/gym-environment/contents"
+# Agent template repo: always use the ``test`` branch (not default ``main``).
+_GYM_ENV_REPO = "AICodingGym/gym-environment"
+_GYM_ENV_REF = "test"
 _GYM_ENV_SKIP = {"README.md"}
 
 
+def _gym_env_contents_api_url(subpath: str = "") -> str:
+    """GitHub Contents API URL for gym-environment at branch ``_GYM_ENV_REF``."""
+    base = f"https://api.github.com/repos/{_GYM_ENV_REPO}/contents"
+    subpath = subpath.strip("/")
+    if subpath:
+        base = f"{base}/{subpath}"
+    return f"{base}?ref={_GYM_ENV_REF}"
+
+
 def _install_gym_environment(dest: Path) -> None:
-    """Download gym-environment files into dest and add them to .gitignore."""
+    """Download gym-environment files from the ``test`` branch into dest and add to .gitignore."""
     try:
-        req = urllib.request.Request(_GYM_ENV_API, headers={"Accept": "application/vnd.github.v3+json"})
+        req = urllib.request.Request(
+            _gym_env_contents_api_url(),
+            headers={"Accept": "application/vnd.github.v3+json"},
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             entries = json.loads(resp.read())
     except Exception as e:
@@ -117,7 +135,7 @@ def _install_gym_environment(dest: Path) -> None:
             # Fetch subdirectory contents recursively (one level deep)
             try:
                 sub_req = urllib.request.Request(
-                    f"{_GYM_ENV_API}/{name}",
+                    _gym_env_contents_api_url(name),
                     headers={"Accept": "application/vnd.github.v3+json"},
                 )
                 with urllib.request.urlopen(sub_req, timeout=15) as r:
@@ -177,6 +195,91 @@ def _resolve_workspace(config: dict, workspace_dir: str | None) -> Path:
     if configured:
         return Path(configured).resolve()
     return Path.cwd().resolve()
+
+
+def _session_log_agent_name() -> str:
+    """Agent label for `.log/*.md` (override with env ``AICODINGGYM_AGENT``)."""
+    return os.environ.get("AICODINGGYM_AGENT", "").strip() or "AI assistant"
+
+
+def _submission_csv_relative_to_comp(csv_src: Path, comp_dir: Path) -> list[str]:
+    """Prefer paths under the competition folder for session log clarity."""
+    try:
+        rel = csv_src.resolve().relative_to(comp_dir.resolve())
+        return [rel.as_posix()]
+    except ValueError:
+        return [csv_src.name]
+
+
+def _gym_provenance_from_log_entry(entry: LogEntry) -> dict[str, Any]:
+    """Subset of experiment-log provenance for gym_log.json rows."""
+    prov: dict[str, Any] = {}
+    gp = entry.git_provenance or {}
+    if gp.get("revision_full"):
+        prov["revision_full"] = gp["revision_full"]
+    if gp.get("revision_short"):
+        prov["revision_short"] = gp["revision_short"]
+    if gp.get("branch") is not None:
+        prov["branch"] = gp["branch"]
+    if gp.get("working_tree_clean") is not None:
+        prov["working_tree_clean"] = gp["working_tree_clean"]
+    sa = entry.submission_artifact or {}
+    if sa.get("path"):
+        prov["submission_csv_path"] = sa["path"]
+    if sa.get("sha256"):
+        prov["submission_csv_sha256"] = sa["sha256"]
+    return prov
+
+
+def _mle_platform_submission_session_extra(entry: LogEntry) -> str:
+    """Markdown block for `.log/*.md` platform submission rows."""
+    lines = ["### Platform submission (detail)"]
+    score = entry.submit_score
+    lines.append(
+        f"- **Ground truth (leaderboard) score:** {score!r}"
+        if score is not None
+        else "- **Ground truth (leaderboard) score:** _(not returned or pending)_"
+    )
+    gp = entry.git_provenance or {}
+    if gp.get("revision_full"):
+        lines.append(f"- **Git revision (full):** `{gp['revision_full']}`")
+    if gp.get("revision_short"):
+        lines.append(f"- **Git revision (short):** `{gp['revision_short']}`")
+    if gp.get("branch"):
+        lines.append(f"- **Branch:** `{gp['branch']}`")
+    if "working_tree_clean" in gp:
+        lines.append(f"- **Working tree clean:** `{gp['working_tree_clean']}`")
+    sa = entry.submission_artifact or {}
+    if sa:
+        lines.append(f"- **CSV (relative to competition folder):** `{sa.get('path', '')}`")
+        lines.append(f"- **CSV size (bytes):** {sa.get('size_bytes', '')}")
+        lines.append(f"- **CSV sha256:** `{sa.get('sha256', '')}`")
+    if entry.linked_checkpoint_id:
+        lines.append(
+            f"- **Linked `.mle_log.jsonl` checkpoint id:** `{entry.linked_checkpoint_id}`"
+        )
+    ar = entry.api_result or {}
+    if ar:
+        snippet = json.dumps(ar, ensure_ascii=False)
+        if len(snippet) > 800:
+            snippet = snippet[:800] + "…"
+        lines.append(f"- **API response (sanitized):** {snippet}")
+    return "\n".join(lines)
+
+
+def _checkpoint_session_extra(entry: LogEntry) -> str:
+    """Optional git snapshot for checkpoint session rows."""
+    gp = entry.git_provenance or {}
+    if not gp.get("git_available") and not gp.get("revision_short"):
+        return ""
+    lines = ["### Checkpoint provenance"]
+    if gp.get("revision_short"):
+        lines.append(f"- **Git (short):** `{gp['revision_short']}`")
+    if gp.get("branch"):
+        lines.append(f"- **Branch:** `{gp['branch']}`")
+    if "working_tree_clean" in gp:
+        lines.append(f"- **Working tree clean:** `{gp['working_tree_clean']}`")
+    return "\n".join(lines)
 
 
 def _print_test_summary(lines: list[str], problem_id: str, returncode: int,
@@ -1246,8 +1349,116 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     except APIError as e:
         _error(str(e))
 
+
     score_msg = result.get("message", "Submission received for scoring.")
     score = result.get("score")
+
+    # Enhanced logging: try to infer model/params/benchmark from experiment log
+    workspace = _resolve_workspace(config, None)
+    comp_dir = workspace / competition_id
+    model = None
+    params = None
+    val_score = None
+    val_metric_name: str | None = None
+    log = None
+    if comp_dir.exists():
+        log = ExperimentLog(comp_dir)
+        entries = log.load()
+        # Try to find the most recent experiment log entry with a val_score
+        best_entry: LogEntry | None = None
+        for e in reversed(entries):
+            if e.val_score and e.model:
+                best_entry = e
+                break
+        if best_entry:
+            model = best_entry.model
+            params = best_entry.hyperparams
+            val_score = best_entry.val_score.get("value") if best_entry.val_score else None
+            val_metric_name = (
+                best_entry.val_score.get("metric") if best_entry.val_score else None
+            )
+        # Log submission with all details (git/CSV/API provenance)
+        entry = log.create_entry(
+            summary=message or f"Submit {csv_src.name}",
+            submit_score=score,
+            model=model,
+            val_metric=val_metric_name,
+            val_score=val_score,
+            hyperparams=params,
+            working_dir=comp_dir,
+            event_type="platform_submission",
+            linked_checkpoint_id=best_entry.id if best_entry else None,
+            api_result=result if isinstance(result, dict) else None,
+            csv_path=csv_src,
+        )
+        log.append(entry)
+        # gym_log.json — submission row with leaderboard score (delta vs prior GT)
+        try:
+            gt_score: float | None
+            if score is None:
+                gt_score = None
+            else:
+                try:
+                    gt_score = float(score)
+                except (TypeError, ValueError):
+                    gt_score = None
+            per_gym: dict[str, float] = {}
+            if model and val_score is not None:
+                try:
+                    per_gym[str(model)] = float(val_score)
+                except (TypeError, ValueError):
+                    pass
+            gym_session_log_entry(
+                entry_type="submission",
+                change_summary=message or f"Submit {csv_src.name}",
+                models_used=[str(model)] if model else [],
+                per_model_accuracy=per_gym,
+                ground_truth_accuracy=gt_score,
+                log_path=comp_dir / "gym_log.json",
+                provenance=_gym_provenance_from_log_entry(entry),
+                experiment_log_entry_id=entry.id,
+            )
+        except Exception:
+            pass
+        # Session log update (do not treat `-m` as a "user prompt" - it is optional metadata)
+        try:
+            session_logger = SessionLogger(
+                comp_dir, agent=_session_log_agent_name(), challenge_type="MLE-bench"
+            )
+            files_touched = list(entry.files_changed)
+            if not files_touched:
+                files_touched = _submission_csv_relative_to_comp(csv_src, comp_dir)
+            approach_parts = [
+                f"Submitted `{csv_src.name}` for leaderboard scoring.",
+            ]
+            if model:
+                approach_parts.append(f"Latest `.mle_log.jsonl` checkpoint uses model `{model}`.")
+            if val_score is not None:
+                approach_parts.append(f"Local validation score recorded there: {val_score!r}.")
+            if params:
+                approach_parts.append("Hyperparameters were copied from that checkpoint.")
+            if not model and val_score is None:
+                approach_parts.append(
+                    "No experiment-log entry with both model and val score was found "
+                    "(run `aicodinggym mle log add --no-input -s \"...\" --author ai` after training)."
+                )
+            note = message.strip() if message and message.strip() else None
+            session_logger.append_entry(
+                user_prompt="_(Not from a chat — this entry was created by `aicodinggym mle submit`.)_",
+                approach=" ".join(approach_parts),
+                files_touched=files_touched,
+                outcome=(
+                    f"Leaderboard score: {score}"
+                    if score is not None
+                    else "Submitted (score not returned or pending)."
+                ),
+                cli_submit_message=note,
+                entry_kind="platform_submission",
+                extra_sections=_mle_platform_submission_session_extra(entry),
+                include_summary_footer=True,
+            )
+        except Exception as e:
+            _warn(f"Session log append failed: {e}")
 
     click.echo(
         f"\nSuccessfully submitted prediction for {competition_id}\n"
@@ -1258,3 +1469,219 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     if score is not None:
         click.echo(f"  Score:   {score}\n")
     click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
+
+
+# ---------------------------------------------------------------------------
+# mle log — experiment logging subcommands
+# ---------------------------------------------------------------------------
+
+@mle.group("log")
+def mle_log():
+    """Experiment log — track model changes and scores.
+
+    \b
+    COMMANDS:
+      add     Log a checkpoint (model change, val score, etc.)
+      show    Display the experiment timeline
+      export  Export log to CSV or Markdown
+    """
+    pass
+
+
+@mle_log.command("add")
+@click.argument("competition_id")
+@click.option("--summary", "-s", default=None, help="One-line description of what changed.")
+@click.option("--model", default=None, help="Model name (e.g. XGBoost, HGB).")
+@click.option("--val-metric", default=None, help="Validation metric name (e.g. balanced_accuracy).")
+@click.option("--val-score", default=None, type=float, help="Validation score value.")
+@click.option("--author", default=None, type=click.Choice(["human", "ai"]), help="Who made this change.")
+@click.option("--hyperparams", default=None, help="JSON string of hyperparameters.")
+@click.option("--tags", default=None, help="Comma-separated tags.")
+@click.option(
+    "--no-input",
+    is_flag=True,
+    help="Non-interactive: require -s/--summary; never prompt (for agents/CI).",
+)
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Defaults to configured workspace.",
+)
+def mle_log_add(
+    competition_id: str,
+    summary: str | None,
+    model: str | None,
+    val_metric: str | None,
+    val_score: float | None,
+    author: str | None,
+    hyperparams: str | None,
+    tags: str | None,
+    no_input: bool,
+    workspace_dir: str | None,
+):
+    """Log a checkpoint entry for an MLE-bench competition.
+
+    Agents should pass ``-s``/``--summary`` and ``--no-input`` so nothing is prompted.
+
+    \b
+    EXAMPLES:
+      aicodinggym mle log add irrigation-s6e4 --summary "HGB baseline" --val-score 0.965
+      aicodinggym mle log add irrigation-s6e4 -s "XGB tuning" --model XGBoost --author ai --no-input
+    """
+    config = load_config()
+    workspace = _resolve_workspace(config, workspace_dir)
+    comp_dir = workspace / competition_id
+
+    if not comp_dir.exists():
+        _error(f"Competition directory not found: {comp_dir}")
+
+    explicit_summary = summary is not None
+    if no_input and not explicit_summary:
+        _error("--summary / -s is required with --no-input.")
+    if not explicit_summary:
+        if not sys.stdin.isatty():
+            _error("Missing --summary / -s (non-interactive stdin).")
+        summary = click.prompt("Summary (what changed)")
+
+    skip_prompts = explicit_summary or no_input
+    if skip_prompts:
+        if val_score is not None and not val_metric:
+            val_metric = val_metric or "accuracy"
+    else:
+        if not model:
+            model = click.prompt("Model name", default="", show_default=False) or None
+        if val_score is None:
+            val_str = click.prompt("Val score", default="", show_default=False)
+            if val_str:
+                try:
+                    val_score = float(val_str)
+                except ValueError:
+                    _warn(f"Invalid val score '{val_str}', skipping.")
+        if val_score is not None and not val_metric:
+            val_metric = click.prompt("Val metric", default="accuracy")
+
+    hp = None
+    if hyperparams:
+        try:
+            hp = json.loads(hyperparams)
+        except json.JSONDecodeError:
+            _warn(f"Invalid JSON for hyperparams, skipping.")
+    elif not skip_prompts:
+        hp_str = click.prompt("Hyperparams (JSON)", default="", show_default=False)
+        if hp_str:
+            try:
+                hp = json.loads(hp_str)
+            except json.JSONDecodeError:
+                _warn("Invalid JSON, skipping.")
+
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    if not tags and not skip_prompts:
+        tags_str = click.prompt("Tags (comma-separated)", default="", show_default=False)
+        if tags_str:
+            tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+    log = ExperimentLog(comp_dir)
+    entry = log.create_entry(
+        summary=summary,
+        author=author,
+        model=model,
+        val_metric=val_metric,
+        val_score=val_score,
+        hyperparams=hp,
+        tags=tag_list,
+        working_dir=comp_dir,
+        event_type="checkpoint",
+    )
+    log.append(entry)
+    # Session log update (`--summary` is a checkpoint note, not a chat transcript)
+    try:
+        session_logger = SessionLogger(
+            comp_dir, agent=_session_log_agent_name(), challenge_type="MLE-bench"
+        )
+        ap_parts = [f"**Checkpoint:** {summary}"]
+        if model:
+            ap_parts.append(f"Model `{model}`.")
+        if val_score is not None and val_metric:
+            ap_parts.append(f"Val ({val_metric}): {val_score!r}.")
+        elif val_score is not None:
+            ap_parts.append(f"Val: {val_score!r}.")
+        if hp:
+            ap_parts.append(f"Hyperparams: {hp!r}.")
+        ck_extra = _checkpoint_session_extra(entry)
+        session_logger.append_entry(
+            user_prompt="_(Not from a chat — this entry was created by `aicodinggym mle log add`.)_",
+            approach=" ".join(ap_parts),
+            files_touched=entry.files_changed,
+            outcome="Appended to `.mle_log.jsonl`.",
+            entry_kind="checkpoint",
+            extra_sections=ck_extra if ck_extra else None,
+            include_summary_footer=True,
+        )
+    except Exception as e:
+        _warn(f"Session log append failed: {e}")
+    click.echo(f"Logged: #{len(log.load())} — {summary}")
+
+
+@mle_log.command("show")
+@click.argument("competition_id")
+@click.option("-n", "last_n", default=None, type=int, help="Show only the last N entries.")
+@click.option("--expand", is_flag=True, help="Expand all entries with full details.")
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Defaults to configured workspace.",
+)
+def mle_log_show(competition_id: str, last_n: int | None, expand: bool,
+                 workspace_dir: str | None):
+    """Display the experiment timeline for an MLE-bench competition.
+
+    \b
+    EXAMPLES:
+      aicodinggym mle log show irrigation-s6e4
+      aicodinggym mle log show irrigation-s6e4 -n 5
+      aicodinggym mle log show irrigation-s6e4 --expand
+    """
+    config = load_config()
+    workspace = _resolve_workspace(config, workspace_dir)
+    comp_dir = workspace / competition_id
+
+    if not comp_dir.exists():
+        _error(f"Competition directory not found: {comp_dir}")
+
+    log = ExperimentLog(comp_dir)
+    click.echo(log.render_timeline(last_n=last_n, expand_all=expand))
+
+
+@mle_log.command("export")
+@click.argument("competition_id")
+@click.option("--format", "fmt", default="csv", type=click.Choice(["csv", "md"]),
+              help="Export format (csv or md).")
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Defaults to configured workspace.",
+)
+def mle_log_export(competition_id: str, fmt: str, workspace_dir: str | None):
+    """Export the experiment log to CSV or Markdown.
+
+    \b
+    EXAMPLES:
+      aicodinggym mle log export irrigation-s6e4
+      aicodinggym mle log export irrigation-s6e4 --format md
+    """
+    config = load_config()
+    workspace = _resolve_workspace(config, workspace_dir)
+    comp_dir = workspace / competition_id
+
+    if not comp_dir.exists():
+        _error(f"Competition directory not found: {comp_dir}")
+
+    log = ExperimentLog(comp_dir)
+    entries = log.load()
+    if not entries:
+        click.echo("No experiment log entries found.")
+        return
+
+    ext = "csv" if fmt == "csv" else "md"
+    out_path = comp_dir / f"{competition_id}_experiment_log.{ext}"
+
+    content = log.export_csv() if fmt == "csv" else log.export_markdown()
+    out_path.write_text(content, encoding="utf-8")
+    click.echo(f"Exported {len(entries)} entries to {out_path}")

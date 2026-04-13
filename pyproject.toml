@@ -37,3 +37,7 @@ packages = ["aicodinggym"]
 
 [tool.setuptools.package-dir]
 aicodinggym = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
