@@ -103,8 +103,39 @@ def cr_submit_review(user_id: str, problem_id: str, review: str) -> dict:
 
 
 def mlebench_download_info(user_id: str, competition_id: str, dest_path: str) -> None:
-    """Download dataset for an MLE-bench competition directly to dest_path."""
-    resp = _get(f"competitions/{competition_id}/download", stream=True)
+    """Download dataset for an MLE-bench competition directly to dest_path.
+
+    Uses a long read timeout: large zips can take many minutes between chunks
+    over slow links; the default 30s read timeout would abort mid-stream.
+    """
+    read_s = int(os.environ.get("AICODINGGYM_DOWNLOAD_READ_TIMEOUT", "0"))
+    if read_s <= 0:
+        read_s = 7200  # seconds between reads; large zips need headroom
+    url = f"{API_BASE}/competitions/{competition_id}/download"
+    try:
+        resp = requests.get(
+            url,
+            stream=True,
+            timeout=(120, read_s),
+        )
+        resp.raise_for_status()
+    except requests.ConnectionError:
+        raise APIError(
+            f"Cannot connect to {API_BASE}.\n"
+            "Check your internet connection and try again."
+        )
+    except requests.Timeout:
+        raise APIError(f"Download from {url} timed out.")
+    except requests.HTTPError as e:
+        body = ""
+        try:
+            body = e.response.json().get("detail", e.response.text)
+        except Exception:
+            body = e.response.text
+        raise APIError(f"API error (HTTP {e.response.status_code}): {body}")
+    except requests.RequestException as e:
+        raise APIError(f"Request failed: {e}")
+
     with open(dest_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
