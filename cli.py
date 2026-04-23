@@ -84,6 +84,35 @@ _GYM_ENV_API = "https://api.github.com/repos/AICodingGym/gym-environment/content
 _GYM_ENV_SKIP = {"README.md"}
 
 
+def _download_directory(api_url: str, dest_dir: Path) -> None:
+    """Recursively download all files from a GitHub API directory listing."""
+    try:
+        req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github.v3+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            entries = json.loads(r.read())
+    except Exception as e:
+        _warn(f"Failed to list directory {dest_dir.name}: {e}")
+        return
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        name = entry.get("name", "")
+        etype = entry.get("type")
+        if etype == "file":
+            url = entry.get("download_url")
+            if not url:
+                continue
+            try:
+                with urllib.request.urlopen(url, timeout=15) as r:
+                    (dest_dir / name).write_bytes(r.read())
+            except Exception as e:
+                _warn(f"Failed to download {dest_dir.name}/{name}: {e}")
+        elif etype == "dir":
+            sub_url = entry.get("url")
+            if sub_url:
+                _download_directory(sub_url, dest_dir / name)
+
+
 def _install_gym_environment(dest: Path) -> None:
     """Download gym-environment files into dest and add them to .gitignore."""
     try:
@@ -114,30 +143,9 @@ def _install_gym_environment(dest: Path) -> None:
                 _warn(f"Failed to download {name}: {e}")
 
         elif etype == "dir":
-            # Fetch subdirectory contents recursively (one level deep)
-            try:
-                sub_req = urllib.request.Request(
-                    f"{_GYM_ENV_API}/{name}",
-                    headers={"Accept": "application/vnd.github.v3+json"},
-                )
-                with urllib.request.urlopen(sub_req, timeout=15) as r:
-                    sub_entries = json.loads(r.read())
-            except Exception as e:
-                _warn(f"Failed to list directory {name}: {e}")
-                continue
-
-            sub_dir = dest / name
-            sub_dir.mkdir(parents=True, exist_ok=True)
-            for sub in sub_entries:
-                sub_name = sub.get("name", "")
-                sub_url = sub.get("download_url")
-                if sub.get("type") != "file" or not sub_url:
-                    continue
-                try:
-                    with urllib.request.urlopen(sub_url, timeout=15) as r:
-                        (sub_dir / sub_name).write_bytes(r.read())
-                except Exception as e:
-                    _warn(f"Failed to download {name}/{sub_name}: {e}")
+            sub_url = entry.get("url")
+            if sub_url:
+                _download_directory(sub_url, dest / name)
             downloaded.append(name)
 
     if not downloaded:
