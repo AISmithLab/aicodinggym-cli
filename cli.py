@@ -28,6 +28,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,7 @@ from .config import (
 from .experiment_log import ExperimentLog, LogEntry
 from .gym_logger import log_entry as gym_session_log_entry
 from .session_log import SessionLogger
+from .supervisor_assets import ensure_supervisor_assets
 from .git_ops import (
     add_commit_push,
     check_tool_installed,
@@ -171,6 +173,183 @@ def _install_gym_environment(dest: Path) -> None:
         with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(block)
 
+
+
+def _ensure_supervisor_assets_with_fallback(dest: Path, problem_id: str, challenge: str) -> None:
+    """Use template assets first; generate only if any are missing."""
+    required = (
+        dest / "supervisor.sh",
+        dest / "dashboard.html",
+        dest / "tools" / "notebook_metrics.py",
+    )
+    if all(path.exists() for path in required):
+        return
+    ensure_supervisor_assets(dest, problem_id, challenge)
+
+
+def _find_bash() -> str | None:
+    """Return a path to a usable Bash interpreter, or ``None`` if unavailable.
+
+    Priority order:
+        1. ``$BASH`` environment variable if it points to an existing file.
+        2. ``bash`` on ``PATH`` (respected on macOS / Linux / WSL).
+        3. Git for Windows' ``bash.exe`` (common on Windows dev boxes).
+    """
+    candidates: list[str] = []
+    env_bash = os.environ.get("BASH")
+    if env_bash:
+        candidates.append(env_bash)
+    # ``shutil.which`` on Windows excludes WSL's ``bash.exe`` shim by design
+    # (it's a Windows Store alias), which is what we want: we prefer Git Bash.
+    import shutil as _shutil
+    which = _shutil.which("bash")
+    if which:
+        # Avoid the WSL forward-shim in System32 unless the user is actually on Linux.
+        if platform.system() == "Windows" and which.lower().startswith(r"c:\windows\system32"):
+            pass
+        else:
+            candidates.append(which)
+    if platform.system() == "Windows":
+        for guess in (
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ):
+            candidates.append(guess)
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return None
+
+
+def _autostart_supervisor(problem_dir: Path) -> None:
+    """Launch ``./supervisor.sh --watch`` in the background inside *problem_dir*.
+
+    Failures are **non-fatal**: if bash is unavailable or the spawn fails we
+    print a short hint and return so ``fetch``/``download`` still succeeds.
+    The watcher writes all output to ``<problem_dir>/.supervisor.log`` and
+    records its PID in ``<problem_dir>/.supervisor.lock``.
+    """
+    problem_dir = Path(problem_dir)
+    supervisor = problem_dir / "supervisor.sh"
+    if not supervisor.exists():
+        return
+
+    # Skip if a watcher appears to already be running. The PID in the lock file
+    # lives in Git Bash's POSIX PID namespace on Windows, which does not line up
+    # with Windows PIDs, so we also fall back to a "lock file is fresh" check.
+    lock = problem_dir / ".supervisor.lock"
+    if lock.exists():
+        try:
+            age_seconds = max(0.0, time.time() - lock.stat().st_mtime)
+        except OSError:
+            age_seconds = float("inf")
+        pid: int | None = None
+        try:
+            pid_text = lock.read_text(encoding="utf-8").strip()
+            pid = int(pid_text) if pid_text.isdigit() else None
+        except OSError:
+            pid = None
+        if (pid and _pid_alive(pid)) or age_seconds < 30:
+            click.echo("Supervisor watcher already running for this folder; skipping auto-start.")
+            return
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+    bash = _find_bash()
+    if not bash:
+        click.echo(
+            "Note: could not find bash on PATH, so supervisor.sh --watch was not auto-started.\n"
+            "      Install Git for Windows (https://git-scm.com/download/win) or WSL, then run:\n"
+            f"        cd {problem_dir} && ./supervisor.sh --watch &"
+        )
+        return
+
+    log_path = problem_dir / ".supervisor.log"
+    try:
+        # The subprocess is launched with cwd=problem_dir, so a plain ``./supervisor.sh``
+        # invocation is enough. Avoid embedding native paths into the -lc command string,
+        # which confuses Git Bash on Windows.
+        cmd = [bash, "-lc", f"./{_shquote(supervisor.name)} --watch"]
+        log_fh = open(log_path, "ab", buffering=0)
+        kwargs: dict[str, Any] = {
+            "stdout": log_fh,
+            "stderr": log_fh,
+            "stdin": subprocess.DEVNULL,
+            "cwd": str(problem_dir),
+        }
+        if platform.system() == "Windows":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            kwargs["close_fds"] = False
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)  # type: ignore[arg-type]
+        dashboard_path = problem_dir / "dashboard.html"
+        opened = _open_in_browser(dashboard_path)
+        if opened:
+            click.echo(
+                f"Supervisor watcher started in background (logs: {log_path.name}); "
+                f"opened {dashboard_path.name} in your browser."
+            )
+        else:
+            click.echo(
+                f"Supervisor watcher started in background (logs: {log_path.name}). "
+                f"Open {dashboard_path} to see live activity."
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        _warn(
+            f"Could not auto-start supervisor.sh --watch: {exc}. "
+            f"Start it manually with: cd {problem_dir} && ./supervisor.sh --watch"
+        )
+
+
+def _open_in_browser(path: Path) -> bool:
+    """Best-effort open a local file in the user's default browser.
+
+    Returns True if the open call was dispatched, False otherwise. Never
+    raises - a missing display / headless box should not break ``fetch``.
+    """
+    try:
+        if not path.exists():
+            # Create a minimal placeholder so the browser has something to load;
+            # the watcher will overwrite it moments later.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("<!doctype html><title>AI Coding Gym</title><p>Preparing dashboard\u2026</p>", encoding="utf-8")
+        import webbrowser
+        return bool(webbrowser.open(path.resolve().as_uri()))
+    except Exception:
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform ``kill(0)`` equivalent."""
+    try:
+        if platform.system() == "Windows":
+            # ``tasklist`` is universally available on Windows; short-circuit via signal.
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            return str(pid) in out.stdout
+        else:
+            os.kill(pid, 0)
+            return True
+    except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _shquote(text: str) -> str:
+    """Minimal POSIX-shell quoting sufficient for paths used by the autostart shim."""
+    if not text:
+        return "''"
+    if all(ch.isalnum() or ch in "@%+=:,./-_" for ch in text):
+        return text
+    return "'" + text.replace("'", "'\"'\"'") + "'"
 
 
 def _resolve_user_id(config: dict, user_id: str | None) -> str:
@@ -632,6 +811,8 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     _install_gym_environment(workspace / problem_id)
+    _ensure_supervisor_assets_with_fallback(workspace / problem_id, problem_id, "swe")
+    _autostart_supervisor(workspace / problem_id)
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -1125,6 +1306,8 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     _install_gym_environment(workspace / problem_id)
+    _ensure_supervisor_assets_with_fallback(workspace / problem_id, problem_id, "cr")
+    _autostart_supervisor(workspace / problem_id)
 
     problem_dir = workspace / problem_id
 
@@ -1286,12 +1469,44 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
         _error(str(e))
 
     _install_gym_environment(workspace / competition_id)
+    _ensure_supervisor_assets_with_fallback(workspace / competition_id, competition_id, "mle")
+    _autostart_supervisor(workspace / competition_id)
 
     click.echo(
         f"\nDataset downloaded to: {dest_path}\n"
         f"\nNext step: train your model and submit predictions with:\n"
         f"  aicodinggym mle submit {competition_id} -F your_predictions.csv"
     )
+
+
+@main.command("init-supervisors")
+@click.option("--workspace-dir", default=None, type=click.Path(),
+              help="Workspace directory. Defaults to configured workspace.")
+def init_supervisors(workspace_dir: str | None):
+    """Create supervisor assets for all existing problem directories."""
+    config = load_config()
+    workspace = _resolve_workspace(config, workspace_dir)
+    created_for = 0
+
+    for child in workspace.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name.startswith("."):
+            continue
+        if (child / ".git").exists():
+            challenge = "swe"
+        elif (child / "data").exists():
+            challenge = "mle"
+        elif (child / "diff.patch").exists():
+            challenge = "cr"
+        else:
+            continue
+
+        ensure_supervisor_assets(child, child.name, challenge)
+        _autostart_supervisor(child)
+        created_for += 1
+
+    click.echo(f"Initialized supervisor assets for {created_for} problem folder(s) in {workspace}.")
 
 
 @mle.command("submit")

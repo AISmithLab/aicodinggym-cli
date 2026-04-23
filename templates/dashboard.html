@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="5" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MLE Bench Logger</title>
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23F97316'/><text x='50%25' y='56%25' text-anchor='middle' font-family='Consolas,monospace' font-size='18' font-weight='800' fill='white'>%3E_</text></svg>" />
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #FAFAF9;
+      --surface: #FFFFFF;
+      --surface-muted: #F5F5F4;
+      --panel: #FFFFFF;
+      --border: #E7E5E4;
+      --border-strong: #D6D3D1;
+      --text: #1C1917;
+      --text-soft: #44403C;
+      --muted: #78716C;
+      --accent: #F97316;
+      --accent-strong: #EA580C;
+      --accent-soft: #FFF7ED;
+      --plus: #15803D;
+      --plus-bg: #DCFCE7;
+      --minus: #B91C1C;
+      --minus-bg: #FEE2E2;
+      --info: #1D4ED8;
+      --info-bg: #DBEAFE;
+      --code-bg: #FFF7ED;
+      --code-fg: #9A3412;
+      --shadow-sm: 0 1px 2px rgba(28,25,23,0.04);
+      --shadow-md: 0 4px 16px rgba(28,25,23,0.06);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body { font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+
+    /* Header / brand --------------------------------------------------- */
+    header { position: sticky; top: 0; z-index: 10; background: rgba(255,255,255,0.88); backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); padding: 14px 28px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { width: 36px; height: 36px; border-radius: 9px; background: var(--accent); color: #fff; display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 4px 12px rgba(249,115,22,0.25); font-family: ui-monospace, Consolas, Menlo, monospace; font-weight: 800; font-size: 16px; letter-spacing: -1px; }
+    .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+    .brand-title { font-size: 17px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+    .brand-sub { font-size: 11.5px; color: var(--muted); }
+    .brand-sub .dot { margin: 0 6px; color: var(--border-strong); }
+    .beta { display: inline-block; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-strong); font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; margin-left: 6px; vertical-align: middle; }
+
+    .stats { display: flex; align-items: center; gap: 22px; margin-left: auto; }
+    .stat { display: flex; flex-direction: column; gap: 2px; }
+    .stat .label { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+    .stat .value { font-size: 16px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+    .stat .value.accent { color: var(--accent-strong); }
+
+    main { max-width: 1120px; margin: 0 auto; padding: 24px 28px 56px; }
+
+    /* Panels & cards --------------------------------------------------- */
+    .panel { border: 1px solid var(--border); border-radius: 14px; padding: 16px 20px; margin-bottom: 20px; background: var(--panel); box-shadow: var(--shadow-sm); }
+    .panel h2 { margin: 0 0 10px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+
+    .card { border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; margin-bottom: 10px; background: var(--surface); box-shadow: var(--shadow-sm); }
+    .card .row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .card h3 { margin: 0; font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: -0.005em; }
+    .card .time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; margin-left: auto; }
+    .card .meta { color: var(--text-soft); font-size: 12.5px; margin: 6px 0 0; word-break: break-word; }
+    .card .meta code { background: var(--code-bg); padding: 1px 6px; border-radius: 5px; color: var(--code-fg); font-size: 11.5px; font-family: ui-monospace, Menlo, Consolas, monospace; border: 1px solid #FED7AA; }
+
+    /* Approach summary ------------------------------------------------- */
+    .approach .approach-header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .approach .approach-header h2 { margin: 0; color: var(--muted); }
+    .approach .approach-sub { color: var(--muted); font-size: 11.5px; }
+    .approach-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    @media (max-width: 860px) { .approach-grid { grid-template-columns: 1fr; } }
+    .approach-col { background: var(--surface-muted); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .approach-col h3 { margin: 0 0 8px; font-size: 11px; color: var(--accent-strong); text-transform: uppercase; letter-spacing: 0.09em; font-weight: 700; }
+    .approach-col ul { margin: 0; padding-left: 18px; }
+    .approach-col li { font-size: 12.5px; line-height: 1.6; margin: 4px 0; color: var(--text-soft); }
+    .approach-col li b { color: var(--text); font-weight: 700; }
+    .approach-col .empty { color: var(--muted); font-size: 12px; list-style: none; margin-left: -16px; }
+    .approach-dim { color: var(--muted); font-weight: 400; font-size: 11.5px; }
+    .approach-howto { margin-top: 14px; border-top: 1px dashed var(--border-strong); padding-top: 10px; }
+    .approach-howto summary { color: var(--accent-strong); font-size: 12px; font-weight: 600; }
+    .approach-howto ol { margin: 10px 0 0; padding-left: 20px; color: var(--text-soft); }
+    .approach-howto ol li { font-size: 12.5px; line-height: 1.65; margin: 3px 0; }
+    .approach-howto code { background: var(--code-bg); padding: 1px 6px; border-radius: 5px; color: var(--code-fg); font-size: 11.5px; border: 1px solid #FED7AA; }
+
+    /* Metric chart ----------------------------------------------------- */
+    #metricChart { width: 100%; height: 210px; display: block; font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Arial, sans-serif; }
+    #metricChart .axis { stroke: var(--border); stroke-width: 1; }
+    #metricChart .gridlabel { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+    #metricChart .pt-label { fill: var(--text-soft); font-size: 11.5px; font-variant-numeric: tabular-nums; text-anchor: middle; }
+    #metricChart .pt-label.latest { fill: var(--accent-strong); font-size: 13.5px; font-weight: 700; }
+
+    /* Disclosures & pills --------------------------------------------- */
+    details { margin-top: 8px; }
+    details summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; padding: 4px 0; font-weight: 500; }
+    details summary:hover { color: var(--text); }
+    details[open] summary { color: var(--text); margin-bottom: 4px; }
+    pre { white-space: pre-wrap; margin: 0; font-size: 11.5px; line-height: 1.5; font-family: ui-monospace, Menlo, Consolas, monospace; overflow-x: auto; background: var(--surface-muted); color: var(--text); border-radius: 8px; padding: 10px 12px; border: 1px solid var(--border); }
+    .plus { color: var(--plus); font-weight: 600; }
+    .minus { color: var(--minus); font-weight: 600; }
+    .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.02em; border: 1px solid transparent; }
+    .pill.ok { background: var(--plus-bg); color: var(--plus); border-color: #BBF7D0; }
+    .pill.fail { background: var(--minus-bg); color: var(--minus); border-color: #FECACA; }
+    .pill.info { background: var(--accent-soft); color: var(--accent-strong); border-color: #FED7AA; }
+    .empty { color: var(--muted); font-size: 12px; padding: 8px 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">&gt;_</div>
+      <div class="brand-text">
+        <div class="brand-title">MLE Bench Logger<span class="beta">Beta</span></div>
+        <div class="brand-sub">AICodingGym<span class="dot">&middot;</span>live supervisor feed</div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><span class="label">Best accuracy</span><span class="value accent" id="latestMetric">&mdash;</span></div>
+      <div class="stat"><span class="label">Updated</span><span class="value" id="latestTime">&mdash;</span></div>
+      <div class="stat"><span class="label">Cards</span><span class="value" id="cardCount">0</span></div>
+    </div>
+  </header>
+  <main>
+    <section id="approach" class="panel approach">
+      <div class="approach-header"><h2>Approach summary</h2></div>
+      <div class="empty">Create <code>solution.ipynb</code> and save it &mdash; this panel will auto-summarize your preprocessing, model, and evaluation in plain English.</div>
+    </section>
+    <div class="panel">
+      <h2>Metric trend (<span id="metricDirection">higher is better</span>)</h2>
+      <svg id="metricChart" viewBox="0 0 1000 210" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+    <div id="cards"></div>
+  </main>
+  <script>
+    (function () {
+      const cards = Array.from(document.querySelectorAll("#cards .card"));
+      document.getElementById("cardCount").textContent = cards.length;
+      const metricCards = cards.filter((c) => c.hasAttribute("data-metric"));
+      const values = metricCards.map((c) => Number(c.getAttribute("data-metric"))).filter(Number.isFinite);
+      const svg = document.getElementById("metricChart");
+      const latestEl = document.getElementById("latestMetric");
+      const latestTimeEl = document.getElementById("latestTime");
+      if (cards.length) {
+        const t = cards[cards.length - 1].querySelector(".time");
+        if (t) latestTimeEl.textContent = t.textContent;
+      }
+      if (!values.length) {
+        svg.innerHTML = '<text x="20" y="30" fill="#78716C" font-size="12">No metric values yet. Add a VAL_ACC: line to your notebook.</text>';
+        return;
+      }
+      const fmt = (v) => {
+        const a = Math.abs(v);
+        if (a >= 100) return v.toFixed(1);
+        if (a >= 1) return v.toFixed(3);
+        return v.toFixed(4);
+      };
+      latestEl.textContent = fmt(Math.max(...values));
+      const w = 1000, h = 210, padL = 60, padR = 64, padT = 24, padB = 30;
+      const min = Math.min(...values), max = Math.max(...values);
+      const span = (max - min) || Math.max(1e-9, Math.abs(max) * 0.01);
+      const xOf = (i) => padL + (i * (w - padL - padR) / Math.max(values.length - 1, 1));
+      const yOf = (v) => h - padB - ((v - min) / span) * (h - padT - padB);
+      const STROKE = "#F97316";
+      if (values.length === 1) {
+        const v = values[0];
+        svg.innerHTML =
+          `<line class="axis" x1="${padL}" y1="${h-padB}" x2="${w-padR}" y2="${h-padB}" />` +
+          `<circle cx="${w/2}" cy="${h/2}" r="6" fill="${STROKE}" />` +
+          `<text class="pt-label latest" x="${w/2}" y="${h/2 - 16}">${fmt(v)}</text>` +
+          `<text class="gridlabel" x="${padL}" y="${h - 8}" text-anchor="start">single observation</text>`;
+        return;
+      }
+      const gridLines = [min, (min + max) / 2, max];
+      let html = "";
+      for (const g of gridLines) {
+        const yy = yOf(g);
+        html +=
+          `<line class="axis" x1="${padL}" y1="${yy}" x2="${w-padR}" y2="${yy}" stroke-dasharray="3 4" />` +
+          `<text class="gridlabel" x="${padL - 8}" y="${yy + 3}" text-anchor="end">${fmt(g)}</text>`;
+      }
+      const pts = values.map((v, i) => `${xOf(i)},${yOf(v)}`);
+      html += `<polyline fill="none" stroke="${STROKE}" stroke-width="2.75" stroke-linejoin="round" stroke-linecap="round" points="${pts.join(" ")}" />`;
+      values.forEach((v, i) => {
+        const x = xOf(i), y = yOf(v);
+        const isLatest = i === values.length - 1;
+        html += `<circle cx="${x}" cy="${y}" r="${isLatest ? 5.5 : 3.25}" fill="${STROKE}" stroke="#FFFFFF" stroke-width="${isLatest ? 2 : 1.5}" />`;
+        const aboveOK = y - padT > 20;
+        const labelY = aboveOK ? y - 10 : y + 18;
+        html += `<text class="pt-label${isLatest ? " latest" : ""}" x="${x}" y="${labelY}">${fmt(v)}</text>`;
+      });
+      svg.innerHTML = html;
+    })();
+  </script>
+</body>
+</html>
