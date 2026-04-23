@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+# AI Coding Gym supervisor: watches the problem folder, appends compact
+# activity cards to dashboard.html, and auto-runs the notebook metric
+# extractor whenever files change.
+#
+# Design goals:
+#   * Zero external deps beyond coreutils + diff + python (rsync optional).
+#   * Compact dashboard: per-file +/- summary up front, full diffs hidden
+#     behind <details>, notebooks never dumped as raw JSON, binary files
+#     reported by name only.
+#   * First run after fetch shows a "Supervisor Ready" card, never the
+#     entire workspace as a "+everything" diff.
+#   * Idempotent: re-running is safe; the lock file prevents doubles.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DASHBOARD_PATH="$ROOT_DIR/dashboard.html"
+NOTEBOOK_PATH="$ROOT_DIR/solution.ipynb"
+SNAPSHOT_DIR="$ROOT_DIR/.supervisor_snapshot"
+LOCK_FILE="$ROOT_DIR/.supervisor.lock"
+HELPER="$ROOT_DIR/tools/notebook_metrics.py"
+APPROACH_HELPER="$ROOT_DIR/tools/summarize_approach.py"
+DEFAULT_CMD="__DEFAULT_CMD__"
+SUBMIT_CMD="__SUBMIT_CMD__"
+WATCH_INTERVAL=3
+MAX_DIFF_LINES_PER_FILE=200
+MAX_OUTPUT_LINES=200
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+html_escape() {
+  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+PY_BIN="${PYTHON:-python}"
+command -v "$PY_BIN" >/dev/null 2>&1 || PY_BIN=python3
+
+ensure_dashboard() {
+  if [[ -f "$DASHBOARD_PATH" ]]; then
+    return
+  fi
+  cat >"$DASHBOARD_PATH" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="5" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MLE Bench Logger</title>
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23F97316'/><text x='50%25' y='56%25' text-anchor='middle' font-family='Consolas,monospace' font-size='18' font-weight='800' fill='white'>%3E_</text></svg>" />
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #FAFAF9;
+      --surface: #FFFFFF;
+      --surface-muted: #F5F5F4;
+      --panel: #FFFFFF;
+      --border: #E7E5E4;
+      --border-strong: #D6D3D1;
+      --text: #1C1917;
+      --text-soft: #44403C;
+      --muted: #78716C;
+      --accent: #F97316;
+      --accent-strong: #EA580C;
+      --accent-soft: #FFF7ED;
+      --plus: #15803D;
+      --plus-bg: #DCFCE7;
+      --minus: #B91C1C;
+      --minus-bg: #FEE2E2;
+      --info: #1D4ED8;
+      --info-bg: #DBEAFE;
+      --code-bg: #FFF7ED;
+      --code-fg: #9A3412;
+      --shadow-sm: 0 1px 2px rgba(28,25,23,0.04);
+      --shadow-md: 0 4px 16px rgba(28,25,23,0.06);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body { font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+
+    /* Header / brand --------------------------------------------------- */
+    header { position: sticky; top: 0; z-index: 10; background: rgba(255,255,255,0.88); backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); padding: 14px 28px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { width: 36px; height: 36px; border-radius: 9px; background: var(--accent); color: #fff; display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 4px 12px rgba(249,115,22,0.25); font-family: ui-monospace, Consolas, Menlo, monospace; font-weight: 800; font-size: 16px; letter-spacing: -1px; }
+    .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+    .brand-title { font-size: 17px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+    .brand-sub { font-size: 11.5px; color: var(--muted); }
+    .brand-sub .dot { margin: 0 6px; color: var(--border-strong); }
+    .beta { display: inline-block; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-strong); font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; margin-left: 6px; vertical-align: middle; }
+
+    .stats { display: flex; align-items: center; gap: 22px; margin-left: auto; }
+    .stat { display: flex; flex-direction: column; gap: 2px; }
+    .stat .label { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+    .stat .value { font-size: 16px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+    .stat .value.accent { color: var(--accent-strong); }
+
+    main { max-width: 1120px; margin: 0 auto; padding: 24px 28px 56px; }
+
+    /* Panels & cards --------------------------------------------------- */
+    .panel { border: 1px solid var(--border); border-radius: 14px; padding: 16px 20px; margin-bottom: 20px; background: var(--panel); box-shadow: var(--shadow-sm); }
+    .panel h2 { margin: 0 0 10px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+
+    .card { border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; margin-bottom: 10px; background: var(--surface); box-shadow: var(--shadow-sm); }
+    .card .row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .card h3 { margin: 0; font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: -0.005em; }
+    .card .time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; margin-left: auto; }
+    .card .meta { color: var(--text-soft); font-size: 12.5px; margin: 6px 0 0; word-break: break-word; }
+    .card .meta code { background: var(--code-bg); padding: 1px 6px; border-radius: 5px; color: var(--code-fg); font-size: 11.5px; font-family: ui-monospace, Menlo, Consolas, monospace; border: 1px solid #FED7AA; }
+
+    /* Approach summary ------------------------------------------------- */
+    .approach .approach-header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .approach .approach-header h2 { margin: 0; color: var(--muted); }
+    .approach .approach-sub { color: var(--muted); font-size: 11.5px; }
+    .approach-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    @media (max-width: 860px) { .approach-grid { grid-template-columns: 1fr; } }
+    .approach-col { background: var(--surface-muted); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .approach-col h3 { margin: 0 0 8px; font-size: 11px; color: var(--accent-strong); text-transform: uppercase; letter-spacing: 0.09em; font-weight: 700; }
+    .approach-col ul { margin: 0; padding-left: 18px; }
+    .approach-col li { font-size: 12.5px; line-height: 1.6; margin: 4px 0; color: var(--text-soft); }
+    .approach-col li b { color: var(--text); font-weight: 700; }
+    .approach-col .empty { color: var(--muted); font-size: 12px; list-style: none; margin-left: -16px; }
+    .approach-dim { color: var(--muted); font-weight: 400; font-size: 11.5px; }
+    .approach-howto { margin-top: 14px; border-top: 1px dashed var(--border-strong); padding-top: 10px; }
+    .approach-howto summary { color: var(--accent-strong); font-size: 12px; font-weight: 600; }
+    .approach-howto ol { margin: 10px 0 0; padding-left: 20px; color: var(--text-soft); }
+    .approach-howto ol li { font-size: 12.5px; line-height: 1.65; margin: 3px 0; }
+    .approach-howto code { background: var(--code-bg); padding: 1px 6px; border-radius: 5px; color: var(--code-fg); font-size: 11.5px; border: 1px solid #FED7AA; }
+
+    /* Metric chart ----------------------------------------------------- */
+    #metricChart { width: 100%; height: 210px; display: block; font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Arial, sans-serif; }
+    #metricChart .axis { stroke: var(--border); stroke-width: 1; }
+    #metricChart .gridlabel { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+    #metricChart .pt-label { fill: var(--text-soft); font-size: 11.5px; font-variant-numeric: tabular-nums; text-anchor: middle; }
+    #metricChart .pt-label.latest { fill: var(--accent-strong); font-size: 13.5px; font-weight: 700; }
+
+    /* Disclosures & pills --------------------------------------------- */
+    details { margin-top: 8px; }
+    details summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; padding: 4px 0; font-weight: 500; }
+    details summary:hover { color: var(--text); }
+    details[open] summary { color: var(--text); margin-bottom: 4px; }
+    pre { white-space: pre-wrap; margin: 0; font-size: 11.5px; line-height: 1.5; font-family: ui-monospace, Menlo, Consolas, monospace; overflow-x: auto; background: var(--surface-muted); color: var(--text); border-radius: 8px; padding: 10px 12px; border: 1px solid var(--border); }
+    .plus { color: var(--plus); font-weight: 600; }
+    .minus { color: var(--minus); font-weight: 600; }
+    .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.02em; border: 1px solid transparent; }
+    .pill.ok { background: var(--plus-bg); color: var(--plus); border-color: #BBF7D0; }
+    .pill.fail { background: var(--minus-bg); color: var(--minus); border-color: #FECACA; }
+    .pill.info { background: var(--accent-soft); color: var(--accent-strong); border-color: #FED7AA; }
+    .empty { color: var(--muted); font-size: 12px; padding: 8px 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">&gt;_</div>
+      <div class="brand-text">
+        <div class="brand-title">MLE Bench Logger<span class="beta">Beta</span></div>
+        <div class="brand-sub">AICodingGym<span class="dot">&middot;</span>live supervisor feed</div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><span class="label">Best accuracy</span><span class="value accent" id="latestMetric">&mdash;</span></div>
+      <div class="stat"><span class="label">Updated</span><span class="value" id="latestTime">&mdash;</span></div>
+      <div class="stat"><span class="label">Cards</span><span class="value" id="cardCount">0</span></div>
+    </div>
+  </header>
+  <main>
+    <section id="approach" class="panel approach">
+      <div class="approach-header"><h2>Approach summary</h2></div>
+      <div class="empty">Create <code>solution.ipynb</code> and save it &mdash; this panel will auto-summarize your preprocessing, model, and evaluation in plain English.</div>
+    </section>
+    <div class="panel">
+      <h2>Metric trend (<span id="metricDirection">higher is better</span>)</h2>
+      <svg id="metricChart" viewBox="0 0 1000 210" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+    <div id="cards"></div>
+  </main>
+  <script>
+    (function () {
+      const cards = Array.from(document.querySelectorAll("#cards .card"));
+      document.getElementById("cardCount").textContent = cards.length;
+      const metricCards = cards.filter((c) => c.hasAttribute("data-metric"));
+      const values = metricCards.map((c) => Number(c.getAttribute("data-metric"))).filter(Number.isFinite);
+      const svg = document.getElementById("metricChart");
+      const latestEl = document.getElementById("latestMetric");
+      const latestTimeEl = document.getElementById("latestTime");
+      if (cards.length) {
+        const t = cards[cards.length - 1].querySelector(".time");
+        if (t) latestTimeEl.textContent = t.textContent;
+      }
+      if (!values.length) {
+        svg.innerHTML = '<text x="20" y="30" fill="#78716C" font-size="12">No metric values yet. Add a VAL_ACC: line to your notebook.</text>';
+        return;
+      }
+      const fmt = (v) => {
+        const a = Math.abs(v);
+        if (a >= 100) return v.toFixed(1);
+        if (a >= 1) return v.toFixed(3);
+        return v.toFixed(4);
+      };
+      latestEl.textContent = fmt(Math.max(...values));
+      const w = 1000, h = 210, padL = 60, padR = 64, padT = 24, padB = 30;
+      const min = Math.min(...values), max = Math.max(...values);
+      const span = (max - min) || Math.max(1e-9, Math.abs(max) * 0.01);
+      const xOf = (i) => padL + (i * (w - padL - padR) / Math.max(values.length - 1, 1));
+      const yOf = (v) => h - padB - ((v - min) / span) * (h - padT - padB);
+      const STROKE = "#F97316";
+      if (values.length === 1) {
+        const v = values[0];
+        svg.innerHTML =
+          `<line class="axis" x1="${padL}" y1="${h-padB}" x2="${w-padR}" y2="${h-padB}" />` +
+          `<circle cx="${w/2}" cy="${h/2}" r="6" fill="${STROKE}" />` +
+          `<text class="pt-label latest" x="${w/2}" y="${h/2 - 16}">${fmt(v)}</text>` +
+          `<text class="gridlabel" x="${padL}" y="${h - 8}" text-anchor="start">single observation</text>`;
+        return;
+      }
+      const gridLines = [min, (min + max) / 2, max];
+      let html = "";
+      for (const g of gridLines) {
+        const yy = yOf(g);
+        html +=
+          `<line class="axis" x1="${padL}" y1="${yy}" x2="${w-padR}" y2="${yy}" stroke-dasharray="3 4" />` +
+          `<text class="gridlabel" x="${padL - 8}" y="${yy + 3}" text-anchor="end">${fmt(g)}</text>`;
+      }
+      const pts = values.map((v, i) => `${xOf(i)},${yOf(v)}`);
+      html += `<polyline fill="none" stroke="${STROKE}" stroke-width="2.75" stroke-linejoin="round" stroke-linecap="round" points="${pts.join(" ")}" />`;
+      values.forEach((v, i) => {
+        const x = xOf(i), y = yOf(v);
+        const isLatest = i === values.length - 1;
+        html += `<circle cx="${x}" cy="${y}" r="${isLatest ? 5.5 : 3.25}" fill="${STROKE}" stroke="#FFFFFF" stroke-width="${isLatest ? 2 : 1.5}" />`;
+        const aboveOK = y - padT > 20;
+        const labelY = aboveOK ? y - 10 : y + 18;
+        html += `<text class="pt-label${isLatest ? " latest" : ""}" x="${x}" y="${labelY}">${fmt(v)}</text>`;
+      });
+      svg.innerHTML = html;
+    })();
+  </script>
+</body>
+</html>
+
+EOF
+}
+
+append_card() {
+  # Args: title, meta_html, body_html, metric_value (optional)
+  local title="$1"
+  local meta="$2"
+  local body_html="$3"
+  local metric="${4:-}"
+  local temp_file
+  temp_file="$(mktemp)"
+  PYTHONIOENCODING=utf-8 PYTHONUTF8=1 "$PY_BIN" - "$DASHBOARD_PATH" "$title" "$meta" "$metric" <<'PY' "$body_html" >"$temp_file"
+import sys, pathlib, datetime
+dash_path, title, meta, metric, body = sys.argv[1:6]
+src = pathlib.Path(dash_path).read_text(encoding="utf-8")
+anchor = '<div id="cards">'
+idx = src.find(anchor)
+out = src
+if idx != -1:
+    insert_at = idx + len(anchor)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    attr = f' data-metric="{metric}"' if metric else ''
+    card_lines = [f'\n      <div class="card"{attr}>']
+    card_lines.append(f'        <div class="row"><h3>{title}</h3><span class="time">{ts}</span></div>')
+    if meta:
+        card_lines.append(f'        <div class="meta">{meta}</div>')
+    card_lines.append(body)
+    card_lines.append('      </div>')
+    out = src[:insert_at] + "\n".join(card_lines) + src[insert_at:]
+# Always force utf-8 bytes to stdout so non-ASCII chars survive round-tripping on Windows.
+sys.stdout.buffer.write(out.encode("utf-8"))
+PY
+  mv "$temp_file" "$DASHBOARD_PATH"
+}
+
+snapshot_workspace() {
+  rm -rf "$SNAPSHOT_DIR"
+  mkdir -p "$SNAPSHOT_DIR"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete \
+      --exclude ".git" \
+      --exclude ".supervisor_snapshot" \
+      --exclude ".supervisor.lock" \
+      --exclude "dashboard.html" \
+      "$ROOT_DIR/" "$SNAPSHOT_DIR/"
+    return
+  fi
+  # Portable fallback when rsync is missing (e.g. Git Bash on Windows).
+  (
+    cd "$ROOT_DIR"
+    find . \
+      -path ./.git -prune -o \
+      -path ./.supervisor_snapshot -prune -o \
+      -name .supervisor.lock -prune -o \
+      -name dashboard.html -prune -o \
+      -print0 |
+      while IFS= read -r -d '' path; do
+        [[ "$path" == "." ]] && continue
+        dest="$SNAPSHOT_DIR/${path#./}"
+        if [[ -d "$path" ]]; then
+          mkdir -p "$dest"
+        else
+          mkdir -p "$(dirname "$dest")"
+          cp -a "$path" "$dest"
+        fi
+      done
+  )
+}
+
+# Builds a compact list of changed files and an optional collapsed <details>
+# with the full diff. Notebooks and binaries get summarized, not dumped.
+# Output layout: first line is ``TITLE=<human-friendly title>``; remaining lines
+# are the HTML body to splice into a card. ``render_change_title`` reads that
+# first line and strips it off so callers can use it as the card title.
+render_change_card_body() {
+  local body_file
+  body_file="$(mktemp)"
+  PYTHONIOENCODING=utf-8 PYTHONUTF8=1 "$PY_BIN" - "$SNAPSHOT_DIR" "$ROOT_DIR" "$MAX_DIFF_LINES_PER_FILE" >"$body_file" <<'PY'
+import difflib, html, os, sys, pathlib, filecmp
+
+snap, root, max_lines = sys.argv[1], sys.argv[2], int(sys.argv[3])
+SKIP_DIRS = {".git", ".supervisor_snapshot", "__pycache__"}
+SKIP_NAMES = {".supervisor.lock", "dashboard.html"}
+BINARY_SUFFIXES = {".zip", ".gz", ".tar", ".pkl", ".joblib", ".npy", ".npz", ".parquet", ".pt", ".pth", ".bin", ".onnx", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".csv", ".xls", ".xlsx"}
+
+def walk(base):
+    files = {}
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if name in SKIP_NAMES:
+                continue
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, base).replace(os.sep, "/")
+            try:
+                files[rel] = os.path.getsize(full)
+            except OSError:
+                pass
+    return files
+
+snap_files = walk(snap) if os.path.isdir(snap) else {}
+root_files = walk(root)
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines(keepends=False)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+def classify(rel):
+    suf = pathlib.PurePosixPath(rel).suffix.lower()
+    if suf == ".ipynb":
+        return "notebook"
+    if suf in BINARY_SUFFIXES:
+        return "binary"
+    return "text"
+
+changes = []  # list of (status, rel, added, removed, diff_html)
+all_rels = sorted(set(snap_files) | set(root_files))
+for rel in all_rels:
+    in_snap = rel in snap_files
+    in_root = rel in root_files
+    snap_path = os.path.join(snap, rel)
+    root_path = os.path.join(root, rel)
+    if in_snap and in_root:
+        # Quick shallow check.
+        try:
+            if filecmp.cmp(snap_path, root_path, shallow=False):
+                continue
+        except OSError:
+            pass
+        status = "modified"
+    elif in_root:
+        status = "added"
+    else:
+        status = "removed"
+
+    kind = classify(rel)
+    added = removed = 0
+    diff_html = ""
+
+    if kind == "notebook":
+        # Avoid dumping JSON; just say "notebook changed" with byte delta.
+        s1 = snap_files.get(rel, 0)
+        s2 = root_files.get(rel, 0)
+        diff_html = f'<pre>notebook {status} (size {s1} \u2192 {s2} bytes)</pre>'
+    elif kind == "binary":
+        s1 = snap_files.get(rel, 0)
+        s2 = root_files.get(rel, 0)
+        diff_html = f'<pre>binary {status} (size {s1} \u2192 {s2} bytes)</pre>'
+    else:
+        a = read_text(snap_path) if in_snap else []
+        b = read_text(root_path) if in_root else []
+        if a is None or b is None:
+            diff_html = f'<pre>{status} (not UTF-8 readable)</pre>'
+        else:
+            diff_lines = list(difflib.unified_diff(a, b, fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm=""))
+            for ln in diff_lines:
+                if ln.startswith("+") and not ln.startswith("+++"):
+                    added += 1
+                elif ln.startswith("-") and not ln.startswith("---"):
+                    removed += 1
+            if len(diff_lines) > max_lines:
+                truncated = diff_lines[:max_lines]
+                truncated.append(f"... ({len(diff_lines) - max_lines} more lines)")
+                diff_lines = truncated
+            rendered = []
+            for ln in diff_lines:
+                esc = html.escape(ln)
+                if ln.startswith("+") and not ln.startswith("+++"):
+                    rendered.append(f'<span class="plus">{esc}</span>')
+                elif ln.startswith("-") and not ln.startswith("---"):
+                    rendered.append(f'<span class="minus">{esc}</span>')
+                else:
+                    rendered.append(esc)
+            body = "\n".join(rendered) if rendered else "(no textual diff)"
+            diff_html = f'<pre>{body}</pre>'
+
+    changes.append((status, rel, added, removed, diff_html))
+
+if not changes:
+    print('TITLE=No changes')
+    print('        <div class="empty">No file changes detected.</div>')
+    sys.exit(0)
+
+# Group by status, preserving order of discovery.
+added_names = [c[1] for c in changes if c[0] == "added"]
+modified_names = [c[1] for c in changes if c[0] == "modified"]
+removed_names = [c[1] for c in changes if c[0] == "removed"]
+total_added = sum(c[2] for c in changes)
+total_removed = sum(c[3] for c in changes)
+
+def _fmt_names(names, limit=3):
+    if not names:
+        return ""
+    shown = [f'<code>{html.escape(n)}</code>' for n in names[:limit]]
+    extra = len(names) - len(shown)
+    if extra > 0:
+        shown.append(f'<span class="muted">+{extra} more</span>')
+    return ", ".join(shown)
+
+parts = []
+if added_names:
+    parts.append(f'<span class="plus">added</span> {_fmt_names(added_names)}')
+if modified_names:
+    parts.append(f'<span class="pill info">edited</span> {_fmt_names(modified_names)}')
+if removed_names:
+    parts.append(f'<span class="minus">removed</span> {_fmt_names(removed_names)}')
+parts.append(f'<span class="plus">+{total_added}</span> / <span class="minus">-{total_removed}</span>')
+summary = " \u00b7 ".join(parts)
+
+# Human-friendly title for the card. Single-file actions get a specific verb.
+def _title():
+    n = len(changes)
+    if n == 1:
+        st, rel, *_ = changes[0]
+        verb = {"added": "Added", "removed": "Removed", "modified": "Edited"}[st]
+        return f'{verb} {rel}'
+    if added_names and not modified_names and not removed_names:
+        return f'Added {len(added_names)} file{"s" if len(added_names)!=1 else ""}'
+    if modified_names and not added_names and not removed_names:
+        # E.g. "Edited solution.ipynb + 2 more"
+        first = modified_names[0]
+        extra = len(modified_names) - 1
+        return f'Edited {first}' + (f' + {extra} more' if extra else '')
+    return f'Changed {n} files'
+
+# The shell caller reads the TITLE= line and strips it before inserting the rest as body.
+print(f'TITLE={_title()}')
+print(f'        <div class="meta">{summary}</div>')
+
+# Collapsed list of per-file diffs.
+print('        <details>')
+print('          <summary>Show per-file diffs</summary>')
+for status, rel, added, removed, diff_html in changes:
+    badge = {"added":"<span class=\"pill ok\">added</span>", "removed":"<span class=\"pill fail\">removed</span>", "modified":"<span class=\"pill info\">modified</span>"}[status]
+    header = f'{badge} <code>{html.escape(rel)}</code>'
+    if added or removed:
+        header += f' <span class="plus">+{added}</span> / <span class="minus">-{removed}</span>'
+    print('          <details>')
+    print(f'            <summary>{header}</summary>')
+    print(f'            {diff_html}')
+    print('          </details>')
+print('        </details>')
+PY
+  cat "$body_file"
+  rm -f "$body_file"
+}
+
+# Read the TITLE= header line out of the body text produced above.
+# Echoes ("title"\n"body") on stdout; caller reads with two `read` calls.
+split_change_output() {
+  local full="$1"
+  local title="${2:-Change Detected}"
+  local first_line
+  first_line="$(printf "%s\n" "$full" | head -n1)"
+  if [[ "$first_line" == TITLE=* ]]; then
+    title="${first_line#TITLE=}"
+    full="$(printf "%s\n" "$full" | tail -n +2)"
+  fi
+  printf '%s\n---END-OF-TITLE---\n%s' "$title" "$full"
+}
+
+# Re-render the "Approach summary" panel from the current notebook contents and
+# splice it into dashboard.html. Always replaces the existing <section id="approach">Ã¢â‚¬Â¦</section>
+# block so the panel stays in sync with solution.ipynb without accumulating history.
+refresh_approach_summary() {
+  [[ -f "$APPROACH_HELPER" ]] || return 0
+  [[ -f "$DASHBOARD_PATH" ]] || return 0
+  local tmp_html
+  tmp_html="$(mktemp)"
+  if ! PYTHONIOENCODING=utf-8 PYTHONUTF8=1 "$PY_BIN" "$APPROACH_HELPER" "$NOTEBOOK_PATH" "$tmp_html" 2>/dev/null; then
+    rm -f "$tmp_html"
+    return 0
+  fi
+  PYTHONIOENCODING=utf-8 PYTHONUTF8=1 "$PY_BIN" - "$DASHBOARD_PATH" "$tmp_html" <<'PY'
+import pathlib, re, sys
+dash_path = pathlib.Path(sys.argv[1])
+frag_path = pathlib.Path(sys.argv[2])
+dash = dash_path.read_text(encoding="utf-8")
+frag = frag_path.read_text(encoding="utf-8").strip()
+pattern = re.compile(r'<section id="approach".*?</section>', re.DOTALL)
+if pattern.search(dash):
+    new = pattern.sub(lambda _m: frag, dash, count=1)
+else:
+    # Older dashboards (before this feature) had no placeholder. Inject after <main>.
+    new = dash.replace("<main>", "<main>\n    " + frag, 1)
+if new != dash:
+    dash_path.write_text(new, encoding="utf-8", newline="\n")
+PY
+  rm -f "$tmp_html"
+}
+
+run_notebook_and_log_metric() {
+  if [[ ! -f "$NOTEBOOK_PATH" ]]; then
+    append_card "Notebook Metric" "No <code>solution.ipynb</code> found yet" '        <div class="empty">Create solution.ipynb to enable automatic metric extraction.</div>'
+    refresh_approach_summary
+    return
+  fi
+  local output status max_acc
+  set +e
+  output="$("$PY_BIN" "$HELPER" "$NOTEBOOK_PATH" 2>&1)"
+  status=$?
+  set -e
+  max_acc="$(printf "%s\n" "$output" | grep -oE 'MAX_VALIDATION_ACCURACY=[^[:space:]]+' | tail -n1 | cut -d= -f2 || true)"
+  [[ -z "${max_acc:-}" ]] && max_acc="NA"
+  # Tail the output to keep the card compact.
+  local tail_output
+  tail_output="$(printf "%s\n" "$output" | tail -n "$MAX_OUTPUT_LINES")"
+  local body
+  body="$(printf '        <details>\n          <summary>Show notebook output (last %d lines)</summary>\n          <pre>%s</pre>\n        </details>' \
+    "$MAX_OUTPUT_LINES" \
+    "$(printf "%s" "$tail_output" | html_escape)")"
+  local pill
+  if [[ "$status" -eq 0 ]]; then
+    pill='<span class="pill ok">ok</span>'
+  else
+    pill='<span class="pill fail">exit '"$status"'</span>'
+  fi
+  local meta
+  if [[ "$max_acc" == "NA" ]]; then
+    meta="$pill <code>MAX_VALIDATION_ACCURACY=NA</code> Ã¢â‚¬â€œ add <code>VAL_ACC: &lt;float&gt;</code> or <code>validation_accuracy: &lt;float&gt;</code> in your notebook"
+    append_card "Notebook Metric" "$meta" "$body"
+  else
+    meta="$pill <code>MAX_VALIDATION_ACCURACY=$max_acc</code>"
+    append_card "Notebook Metric" "$meta" "$body" "$max_acc"
+  fi
+  refresh_approach_summary
+}
+
+run_wrapped_command() {
+  local command="$1"
+  ensure_dashboard
+  snapshot_workspace
+
+  local command_output status
+  set +e
+  command_output="$(bash -lc "$command" 2>&1)"
+  status=$?
+  set -e
+
+  sleep 1
+  local raw_body title body pill meta
+  raw_body="$(render_change_card_body)"
+  title="$(printf "%s" "$raw_body" | head -n1)"
+  if [[ "$title" == TITLE=* ]]; then
+    title="${title#TITLE=}"
+    body="$(printf "%s\n" "$raw_body" | tail -n +2)"
+  else
+    title="AI Run"
+    body="$raw_body"
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    pill='<span class="pill ok">ok</span>'
+  else
+    pill='<span class="pill fail">exit '"$status"'</span>'
+  fi
+  meta="$pill <code>$(printf "%s" "$command" | html_escape)</code>"
+  append_card "$title" "$meta" "$body"
+
+  local tail_output
+  tail_output="$(printf "%s\n" "$command_output" | tail -n "$MAX_OUTPUT_LINES")"
+  local output_body
+  output_body="$(printf '        <details>\n          <summary>Show command output (last %d lines)</summary>\n          <pre>%s</pre>\n        </details>' \
+    "$MAX_OUTPUT_LINES" \
+    "$(printf "%s" "$tail_output" | html_escape)")"
+  append_card "Command Output" "" "$output_body"
+
+  run_notebook_and_log_metric
+}
+
+watch_loop() {
+  ensure_dashboard
+  local first_run=0
+  if [[ ! -d "$SNAPSHOT_DIR" ]]; then
+    first_run=1
+  fi
+  snapshot_workspace
+  # Populate the Approach summary panel immediately so users see it even
+  # before the first notebook run completes.
+  refresh_approach_summary
+  if [[ "$first_run" -eq 1 ]]; then
+    append_card "Supervisor Ready" "<span class=\"pill info\">watching</span> interval=${WATCH_INTERVAL}s Ã¢â‚¬â€œ edits you make will appear below" '        <div class="empty">No changes yet. Start codingÃ¢â‚¬â€each save will append a card.</div>'
+    # Auto-open the dashboard only for manual terminal runs; when the aicodinggym
+    # CLI spawns us in the background stdout is redirected to a file and will
+    # pop the browser itself, so we skip to avoid opening two tabs.
+    if [[ -t 1 ]]; then
+      open_dashboard
+    fi
+  else
+    append_card "Watcher Restarted" "<span class=\"pill info\">watching</span> interval=${WATCH_INTERVAL}s" '        <div class="empty">Resuming watch mode.</div>'
+  fi
+  while true; do
+    sleep "$WATCH_INTERVAL"
+    # Check whether any file actually changed before doing expensive work.
+    local raw title body
+    raw="$(render_change_card_body)"
+    if [[ "$raw" == *"No file changes detected."* ]]; then
+      continue
+    fi
+    title="$(printf "%s" "$raw" | head -n1)"
+    if [[ "$title" == TITLE=* ]]; then
+      title="${title#TITLE=}"
+      body="$(printf "%s\n" "$raw" | tail -n +2)"
+    else
+      title="Change Detected"
+      body="$raw"
+    fi
+    append_card "$title" "" "$body"
+    run_notebook_and_log_metric
+    snapshot_workspace
+  done
+}
+
+submit_flow() {
+  ensure_dashboard
+  local output status ground_truth
+  set +e
+  output="$(bash -lc "$SUBMIT_CMD" 2>&1)"
+  status=$?
+  set -e
+  ground_truth="$(printf "%s\n" "$output" | grep -oEi 'ground[ _-]?truth[^0-9]*[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+  [[ -z "${ground_truth:-}" ]] && ground_truth="Ground Truth: not found in output"
+  local pill
+  if [[ "$status" -eq 0 ]]; then
+    pill='<span class="pill ok">submitted</span>'
+  else
+    pill='<span class="pill fail">submit failed (exit '"$status"')</span>'
+  fi
+  local body
+  body="$(printf '        <div class="meta">%s</div>\n        <details open>\n          <summary>Show submit log</summary>\n          <pre>%s</pre>\n        </details>' \
+    "$(printf "%s" "$ground_truth" | html_escape)" \
+    "$(printf "%s" "$output" | html_escape)")"
+  append_card "Final Result" "$pill" "$body"
+  open_dashboard
+}
+
+open_dashboard() {
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$DASHBOARD_PATH" >/dev/null 2>&1 || true
+  elif command -v open >/dev/null 2>&1; then
+    open "$DASHBOARD_PATH" >/dev/null 2>&1 || true
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Start-Process '$DASHBOARD_PATH'" >/dev/null 2>&1 || true
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  ./supervisor.sh --watch              # background watcher (auto-started on fetch)
+  ./supervisor.sh --cmd "<command>"    # run one command and log the diff
+  ./supervisor.sh --submit             # run the bound submit command
+  ./supervisor.sh --open               # open dashboard.html in the browser
+
+Examples:
+  ./supervisor.sh --watch
+  ./supervisor.sh --cmd "$DEFAULT_CMD"
+  ./supervisor.sh --submit
+EOF
+}
+
+main() {
+  if [[ -f "$LOCK_FILE" ]]; then
+    local pid
+    pid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Supervisor already running (pid $pid). Remove $LOCK_FILE if this is stale."
+      exit 1
+    fi
+    rm -f "$LOCK_FILE"
+  fi
+  trap 'rm -f "$LOCK_FILE"' EXIT
+  echo "$$" >"$LOCK_FILE"
+
+  local mode="watch"
+  local cmd="$DEFAULT_CMD"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --watch) mode="watch" ;;
+      --cmd)
+        shift
+        [[ $# -gt 0 ]] || { echo "Missing value for --cmd"; exit 2; }
+        mode="cmd"
+        cmd="$1"
+        ;;
+      --submit) mode="submit" ;;
+      --open) mode="open" ;;
+      --interval) shift; WATCH_INTERVAL="${1:-3}" ;;
+      -h|--help) usage; return ;;
+      *) echo "Unknown arg: $1"; usage; exit 2 ;;
+    esac
+    shift
+  done
+
+  ensure_dashboard
+  case "$mode" in
+    watch) watch_loop ;;
+    cmd) run_wrapped_command "$cmd" ;;
+    submit) submit_flow ;;
+    open) open_dashboard ;;
+  esac
+}
+
+main "$@"
