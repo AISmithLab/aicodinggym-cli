@@ -9,6 +9,10 @@ The script always writes a valid HTML fragment (<section id="approach"> ... </se
 suitable for splicing into dashboard.html. If parsing fails, a short friendly
 placeholder is emitted so the panel never disappears.
 
+The emitted <section> includes a stable <div id="approachDisplay"> (between
+<!--BEGIN_APPROACH_DISPLAY--> and <!--END_APPROACH_DISPLAY-->) for dashboard
+per-metric snapshot extraction.
+
 Output:
     - A "Preprocessing" column listing TF-IDF, scalers, embeddings, regex rules,
       tokenizers, memorization tables, anything detectable.
@@ -666,8 +670,12 @@ def build_html(notebook_path: Path) -> str:
     return f"""<section id="approach" class="panel approach">
   <div class="approach-header">
     <h2>Approach summary</h2>
+    <span id="approachSelectionLabel" class="approach-sub">Showing latest metric run.</span>
     <span class="approach-sub">Auto-detected from <code>{_h(notebook_path.name)}</code> \u2014 {_h(nb_meta)}. Refreshes on save.</span>
   </div>
+  <div id="trajectorySummary" class="trajectory-panel"></div>
+  <div id="approachDisplay">
+<!--BEGIN_APPROACH_DISPLAY-->
   <div class="approach-grid">
     <div class="approach-col">
       <h3>Preprocessing</h3>
@@ -695,6 +703,8 @@ def build_html(notebook_path: Path) -> str:
       <li><b>Submit</b> when you're happy: <code>aicodinggym mle submit &lt;id&gt; -F submission.csv</code>.</li>
     </ol>
   </details>
+<!--END_APPROACH_DISPLAY-->
+  </div>
 </section>"""
 
 
@@ -706,8 +716,16 @@ def _blend_hint(src: str) -> str | None:
 
 def _empty_section(message: str) -> str:
     return f"""<section id="approach" class="panel approach">
-  <div class="approach-header"><h2>Approach summary</h2></div>
+  <div class="approach-header">
+    <h2>Approach summary</h2>
+    <span id="approachSelectionLabel" class="approach-sub">Showing latest metric run.</span>
+  </div>
+  <div id="trajectorySummary" class="trajectory-panel"></div>
+  <div id="approachDisplay">
+<!--BEGIN_APPROACH_DISPLAY-->
   <div class="empty">{message}</div>
+<!--END_APPROACH_DISPLAY-->
+  </div>
 </section>"""
 
 

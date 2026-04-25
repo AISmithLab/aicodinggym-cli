@@ -1,17 +1,17 @@
-__pycache__/
-*.egg-info/
-dist/
-build/
-.DS_Store
-*.pyc
-
-# Stray per-problem artifacts (created if the CLI dir is accidentally used as a workspace)
-.log/
-.mle_log.jsonl
+﻿# Supervisor runtime artifacts (created if the supervisor is ever run from this dir)
 .supervisor.log
 .supervisor.lock
 .supervisor_snapshot/
+
+# Problem-local session logs (session_log writes here when a dir is treated as a workspace)
+.log/
+.mle_log.jsonl
 gym_log.json
+
+# Python/editor cruft
+__pycache__/
+*.pyc
+.DS_Store
 
 # gym-environment
 .claudeignore
@@ -20,6 +20,10 @@ gym_log.json
 .cursorrules
 .geminiignore
 .github
+.gitignore
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+dashboard.html
+supervisor.sh
+tools
