@@ -5,7 +5,8 @@ The canonical templates live in ``aicodinggym/templates/``. They are shipped as
 package-data so this module works whether the CLI was installed from PyPI or
 as an editable local install. This module is only a **local fallback** for
 :func:`aicodinggym.cli._install_gym_environment`, which normally pulls the
-same files from the ``test`` branch of ``AICodingGym/gym-environment``.
+same files from GitHub (``AICodingGym/gym-environment`` by default; ref via
+``AICODINGGYM_GYM_ENV_REF`` defaulting to ``test``, repo via ``AICODINGGYM_GYM_ENV_REPO``).
 
 If you change the supervisor or dashboard:
   1. Edit ``gym-environment/supervisor.sh`` or ``gym-environment/dashboard.html``

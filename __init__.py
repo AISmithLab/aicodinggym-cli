@@ -7,9 +7,13 @@ Imports are lazy so tooling that loads this file without package context
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.5.1"
+try:
+    __version__ = importlib.metadata.version("aicodinggym-cli")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover - dev without install
+    __version__ = "0.0.0"
 
 __all__ = [
     "__version__",

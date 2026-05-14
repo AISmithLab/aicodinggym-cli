@@ -86,23 +86,45 @@ def _warn(msg: str) -> None:
     click.echo(f"Warning: {msg}", err=True)
 
 
-# Agent template repo: always use the ``test`` branch (not default ``main``).
-_GYM_ENV_REPO = "AICodingGym/gym-environment"
-_GYM_ENV_REF = "test"
 _GYM_ENV_SKIP = {"README.md"}
+_GYM_ENV_MLE_ONLY = {"supervisor.sh", "dashboard.html", "tools"}
+
+
+def _gym_env_repo() -> str:
+    """GitHub ``owner/repo`` for gym-environment assets (override with env)."""
+    return os.environ.get("AICODINGGYM_GYM_ENV_REPO", "").strip() or "AICodingGym/gym-environment"
+
+
+def _gym_env_ref() -> str:
+    """Git ref (branch, tag, or commit) for Contents API ``?ref=``.
+
+    If ``AICODINGGYM_GYM_ENV_REF`` is unset or empty, defaults to ``test`` so
+    fetched problems get the same supervisor/dashboard stack as CI/staging.
+    Set ``AICODINGGYM_GYM_ENV_REF=main`` (or another branch) to override.
+    """
+    ref = os.environ.get("AICODINGGYM_GYM_ENV_REF", "")
+    ref = ref.strip()
+    if ref:
+        return ref
+    return "test"
 
 
 def _gym_env_contents_api_url(subpath: str = "") -> str:
-    """GitHub Contents API URL for gym-environment at branch ``_GYM_ENV_REF``."""
-    base = f"https://api.github.com/repos/{_GYM_ENV_REPO}/contents"
+    """GitHub Contents API URL for gym-environment at the configured ref."""
+    base = f"https://api.github.com/repos/{_gym_env_repo()}/contents"
     subpath = subpath.strip("/")
     if subpath:
         base = f"{base}/{subpath}"
-    return f"{base}?ref={_GYM_ENV_REF}"
+    ref = _gym_env_ref()
+    return f"{base}?ref={ref}"
 
 
-def _install_gym_environment(dest: Path) -> None:
-    """Download gym-environment files from the ``test`` branch into dest and add to .gitignore."""
+def _install_gym_environment(dest: Path, challenge: str | None = None) -> None:
+    """Download gym-environment files from GitHub into dest and add to .gitignore.
+
+    Ref and repo are configurable via ``AICODINGGYM_GYM_ENV_REF`` and
+    ``AICODINGGYM_GYM_ENV_REPO``. When ref is unset, the ``test`` branch is used.
+    """
     try:
         req = urllib.request.Request(
             _gym_env_contents_api_url(),
@@ -116,9 +138,12 @@ def _install_gym_environment(dest: Path) -> None:
 
     downloaded: list[str] = []
 
+    is_mle = (challenge == "mle")
     for entry in entries:
         name = entry.get("name", "")
         if name in _GYM_ENV_SKIP:
+            continue
+        if (not is_mle) and name in _GYM_ENV_MLE_ONLY:
             continue
         etype = entry.get("type")
 
@@ -160,18 +185,25 @@ def _install_gym_environment(dest: Path) -> None:
                     _warn(f"Failed to download {name}/{sub_name}: {e}")
             downloaded.append(name)
 
-    if not downloaded:
-        return
-
     # Append to .gitignore
     gitignore = dest / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     existing_lines = set(existing.splitlines())
-    new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
-    if new_entries:
-        block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
+    if downloaded:
+        new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
+        if new_entries:
+            block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
+            with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(block)
+
+    # Seed .prompt for prompt logging (supervisor reads it on every change cycle).
+    # Gitignored and excluded from snapshot diffs — safe to leave in the folder.
+    prompt_file = dest / ".prompt"
+    if not prompt_file.exists():
+        prompt_file.write_text("", encoding="utf-8")
+    if ".prompt" not in existing_lines and "/.prompt" not in existing_lines:
         with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
-            fh.write(block)
+            fh.write(".prompt\n")
 
 
 
@@ -810,9 +842,7 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
-    _install_gym_environment(workspace / problem_id)
-    _ensure_supervisor_assets_with_fallback(workspace / problem_id, problem_id, "swe")
-    _autostart_supervisor(workspace / problem_id)
+    _install_gym_environment(workspace / problem_id, "swe")
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -1305,9 +1335,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
-    _install_gym_environment(workspace / problem_id)
-    _ensure_supervisor_assets_with_fallback(workspace / problem_id, problem_id, "cr")
-    _autostart_supervisor(workspace / problem_id)
+    _install_gym_environment(workspace / problem_id, "cr")
 
     problem_dir = workspace / problem_id
 
@@ -1468,7 +1496,7 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
     except APIError as e:
         _error(str(e))
 
-    _install_gym_environment(workspace / competition_id)
+    _install_gym_environment(workspace / competition_id, "mle")
     _ensure_supervisor_assets_with_fallback(workspace / competition_id, competition_id, "mle")
     _autostart_supervisor(workspace / competition_id)
 
@@ -1502,11 +1530,12 @@ def init_supervisors(workspace_dir: str | None):
         else:
             continue
 
-        ensure_supervisor_assets(child, child.name, challenge)
-        _autostart_supervisor(child)
-        created_for += 1
+        if challenge == "mle":
+            ensure_supervisor_assets(child, child.name, challenge)
+            _autostart_supervisor(child)
+            created_for += 1
 
-    click.echo(f"Initialized supervisor assets for {created_for} problem folder(s) in {workspace}.")
+    click.echo(f"Initialized supervisor assets for {created_for} MLE folder(s) in {workspace}.")
 
 
 @mle.command("submit")
