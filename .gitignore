@@ -1,9 +1,8 @@
-﻿# Supervisor runtime artifacts (created if the supervisor is ever run from this dir)
+﻿# Runtime artifacts
 .supervisor.log
 .supervisor.lock
 .supervisor_snapshot/
-
-# Problem-local session logs (session_log writes here when a dir is treated as a workspace)
+.logger_runs/
 .log/
 .mle_log.jsonl
 gym_log.json

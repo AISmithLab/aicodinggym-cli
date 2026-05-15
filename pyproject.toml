@@ -33,14 +33,10 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["aicodinggym", "aicodinggym.templates"]
+packages = ["aicodinggym"]
 
 [tool.setuptools.package-dir]
 aicodinggym = "."
-"aicodinggym.templates" = "templates"
-
-[tool.setuptools.package-data]
-"aicodinggym.templates" = ["*.sh", "*.sh.template", "*.html", "*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

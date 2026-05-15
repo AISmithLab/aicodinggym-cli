@@ -54,10 +54,6 @@ from .config import (
     save_config,
     save_credentials,
 )
-from .experiment_log import ExperimentLog, LogEntry
-from .gym_logger import log_entry as gym_session_log_entry
-from .session_log import SessionLogger
-from .supervisor_assets import ensure_supervisor_assets
 from .git_ops import (
     add_commit_push,
     check_tool_installed,
@@ -87,7 +83,7 @@ def _warn(msg: str) -> None:
 
 
 _GYM_ENV_SKIP = {"README.md"}
-_GYM_ENV_MLE_ONLY = {"supervisor.sh", "dashboard.html", "tools"}
+_GYM_ENV_MLE_ONLY: set[str] = set()
 
 
 def _gym_env_repo() -> str:
@@ -138,12 +134,9 @@ def _install_gym_environment(dest: Path, challenge: str | None = None) -> None:
 
     downloaded: list[str] = []
 
-    is_mle = (challenge == "mle")
     for entry in entries:
         name = entry.get("name", "")
         if name in _GYM_ENV_SKIP:
-            continue
-        if (not is_mle) and name in _GYM_ENV_MLE_ONLY:
             continue
         etype = entry.get("type")
 
@@ -185,159 +178,26 @@ def _install_gym_environment(dest: Path, challenge: str | None = None) -> None:
                     _warn(f"Failed to download {name}/{sub_name}: {e}")
             downloaded.append(name)
 
+    # Seed empty solution_log.json if absent (AI agent populates it after each prompt)
+    log_file = dest / "solution_log.json"
+    if not log_file.exists():
+        log_file.write_text(
+            '{"version": "1.0", "problem": "", "problem_type": "mle", "prompts": []}\n',
+            encoding="utf-8",
+        )
+
     # Append to .gitignore
     gitignore = dest / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     existing_lines = set(existing.splitlines())
+    gym_artifacts = [".gym_watcher.lock", ".gym_watcher.log", "solution_log.json", ".dashboard.tmp"]
     if downloaded:
         new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
+        new_entries += [a for a in gym_artifacts if a not in existing_lines and f"/{a}" not in existing_lines]
         if new_entries:
             block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
             with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(block)
-
-    # Seed .prompt for prompt logging (supervisor reads it on every change cycle).
-    # Gitignored and excluded from snapshot diffs — safe to leave in the folder.
-    prompt_file = dest / ".prompt"
-    if not prompt_file.exists():
-        prompt_file.write_text("", encoding="utf-8")
-    if ".prompt" not in existing_lines and "/.prompt" not in existing_lines:
-        with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
-            fh.write(".prompt\n")
-
-
-
-def _ensure_supervisor_assets_with_fallback(dest: Path, problem_id: str, challenge: str) -> None:
-    """Use template assets first; generate only if any are missing."""
-    required = (
-        dest / "supervisor.sh",
-        dest / "dashboard.html",
-        dest / "tools" / "notebook_metrics.py",
-    )
-    if all(path.exists() for path in required):
-        return
-    ensure_supervisor_assets(dest, problem_id, challenge)
-
-
-def _find_bash() -> str | None:
-    """Return a path to a usable Bash interpreter, or ``None`` if unavailable.
-
-    Priority order:
-        1. ``$BASH`` environment variable if it points to an existing file.
-        2. ``bash`` on ``PATH`` (respected on macOS / Linux / WSL).
-        3. Git for Windows' ``bash.exe`` (common on Windows dev boxes).
-    """
-    candidates: list[str] = []
-    env_bash = os.environ.get("BASH")
-    if env_bash:
-        candidates.append(env_bash)
-    # ``shutil.which`` on Windows excludes WSL's ``bash.exe`` shim by design
-    # (it's a Windows Store alias), which is what we want: we prefer Git Bash.
-    import shutil as _shutil
-    which = _shutil.which("bash")
-    if which:
-        # Avoid the WSL forward-shim in System32 unless the user is actually on Linux.
-        if platform.system() == "Windows" and which.lower().startswith(r"c:\windows\system32"):
-            pass
-        else:
-            candidates.append(which)
-    if platform.system() == "Windows":
-        for guess in (
-            r"C:\Program Files\Git\usr\bin\bash.exe",
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
-            r"C:\Program Files (x86)\Git\bin\bash.exe",
-        ):
-            candidates.append(guess)
-    for c in candidates:
-        if c and Path(c).exists():
-            return c
-    return None
-
-
-def _autostart_supervisor(problem_dir: Path) -> None:
-    """Launch ``./supervisor.sh --watch`` in the background inside *problem_dir*.
-
-    Failures are **non-fatal**: if bash is unavailable or the spawn fails we
-    print a short hint and return so ``fetch``/``download`` still succeeds.
-    The watcher writes all output to ``<problem_dir>/.supervisor.log`` and
-    records its PID in ``<problem_dir>/.supervisor.lock``.
-    """
-    problem_dir = Path(problem_dir)
-    supervisor = problem_dir / "supervisor.sh"
-    if not supervisor.exists():
-        return
-
-    # Skip if a watcher appears to already be running. The PID in the lock file
-    # lives in Git Bash's POSIX PID namespace on Windows, which does not line up
-    # with Windows PIDs, so we also fall back to a "lock file is fresh" check.
-    lock = problem_dir / ".supervisor.lock"
-    if lock.exists():
-        try:
-            age_seconds = max(0.0, time.time() - lock.stat().st_mtime)
-        except OSError:
-            age_seconds = float("inf")
-        pid: int | None = None
-        try:
-            pid_text = lock.read_text(encoding="utf-8").strip()
-            pid = int(pid_text) if pid_text.isdigit() else None
-        except OSError:
-            pid = None
-        if (pid and _pid_alive(pid)) or age_seconds < 30:
-            click.echo("Supervisor watcher already running for this folder; skipping auto-start.")
-            return
-        try:
-            lock.unlink()
-        except OSError:
-            pass
-
-    bash = _find_bash()
-    if not bash:
-        click.echo(
-            "Note: could not find bash on PATH, so supervisor.sh --watch was not auto-started.\n"
-            "      Install Git for Windows (https://git-scm.com/download/win) or WSL, then run:\n"
-            f"        cd {problem_dir} && ./supervisor.sh --watch &"
-        )
-        return
-
-    log_path = problem_dir / ".supervisor.log"
-    try:
-        # The subprocess is launched with cwd=problem_dir, so a plain ``./supervisor.sh``
-        # invocation is enough. Avoid embedding native paths into the -lc command string,
-        # which confuses Git Bash on Windows.
-        cmd = [bash, "-lc", f"./{_shquote(supervisor.name)} --watch"]
-        log_fh = open(log_path, "ab", buffering=0)
-        kwargs: dict[str, Any] = {
-            "stdout": log_fh,
-            "stderr": log_fh,
-            "stdin": subprocess.DEVNULL,
-            "cwd": str(problem_dir),
-        }
-        if platform.system() == "Windows":
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-            kwargs["close_fds"] = False
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen(cmd, **kwargs)  # type: ignore[arg-type]
-        dashboard_path = problem_dir / "dashboard.html"
-        opened = _open_in_browser(dashboard_path)
-        if opened:
-            click.echo(
-                f"Supervisor watcher started in background (logs: {log_path.name}); "
-                f"opened {dashboard_path.name} in your browser."
-            )
-        else:
-            click.echo(
-                f"Supervisor watcher started in background (logs: {log_path.name}). "
-                f"Open {dashboard_path} to see live activity."
-            )
-    except Exception as exc:  # pragma: no cover - defensive
-        _warn(
-            f"Could not auto-start supervisor.sh --watch: {exc}. "
-            f"Start it manually with: cd {problem_dir} && ./supervisor.sh --watch"
-        )
 
 
 def _open_in_browser(path: Path) -> bool:
@@ -356,6 +216,53 @@ def _open_in_browser(path: Path) -> bool:
         return bool(webbrowser.open(path.resolve().as_uri()))
     except Exception:
         return False
+
+
+def _autostart_watcher(problem_dir: Path) -> None:
+    """Launch gym_watcher.py in background inside problem_dir. Non-fatal."""
+    problem_dir = Path(problem_dir)
+    watcher = problem_dir / "gym_watcher.py"
+    if not watcher.exists():
+        return
+    lock = problem_dir / ".gym_watcher.lock"
+    if lock.exists():
+        try:
+            pid = int(lock.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid and _pid_alive(pid):
+            click.echo("Gym watcher already running; skipping auto-start.")
+            return
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    log_path = problem_dir / ".gym_watcher.log"
+    try:
+        cmd = [sys.executable, str(watcher), str(problem_dir)]
+        log_fh = open(log_path, "ab", buffering=0)
+        kwargs: dict[str, Any] = {
+            "stdout": log_fh,
+            "stderr": log_fh,
+            "stdin": subprocess.DEVNULL,
+            "cwd": str(problem_dir),
+        }
+        if platform.system() == "Windows":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            kwargs["close_fds"] = False
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)  # type: ignore[arg-type]
+        dashboard = problem_dir / "dashboard.html"
+        opened = _open_in_browser(dashboard)
+        msg = "Gym watcher started (logs: .gym_watcher.log)."
+        if not opened:
+            msg += f" Open {dashboard} to view dashboard."
+        click.echo(msg)
+    except Exception as exc:
+        _warn(f"Could not auto-start gym_watcher.py: {exc}.")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -406,91 +313,6 @@ def _resolve_workspace(config: dict, workspace_dir: str | None) -> Path:
     if configured:
         return Path(configured).resolve()
     return Path.cwd().resolve()
-
-
-def _session_log_agent_name() -> str:
-    """Agent label for `.log/*.md` (override with env ``AICODINGGYM_AGENT``)."""
-    return os.environ.get("AICODINGGYM_AGENT", "").strip() or "AI assistant"
-
-
-def _submission_csv_relative_to_comp(csv_src: Path, comp_dir: Path) -> list[str]:
-    """Prefer paths under the competition folder for session log clarity."""
-    try:
-        rel = csv_src.resolve().relative_to(comp_dir.resolve())
-        return [rel.as_posix()]
-    except ValueError:
-        return [csv_src.name]
-
-
-def _gym_provenance_from_log_entry(entry: LogEntry) -> dict[str, Any]:
-    """Subset of experiment-log provenance for gym_log.json rows."""
-    prov: dict[str, Any] = {}
-    gp = entry.git_provenance or {}
-    if gp.get("revision_full"):
-        prov["revision_full"] = gp["revision_full"]
-    if gp.get("revision_short"):
-        prov["revision_short"] = gp["revision_short"]
-    if gp.get("branch") is not None:
-        prov["branch"] = gp["branch"]
-    if gp.get("working_tree_clean") is not None:
-        prov["working_tree_clean"] = gp["working_tree_clean"]
-    sa = entry.submission_artifact or {}
-    if sa.get("path"):
-        prov["submission_csv_path"] = sa["path"]
-    if sa.get("sha256"):
-        prov["submission_csv_sha256"] = sa["sha256"]
-    return prov
-
-
-def _mle_platform_submission_session_extra(entry: LogEntry) -> str:
-    """Markdown block for `.log/*.md` platform submission rows."""
-    lines = ["### Platform submission (detail)"]
-    score = entry.submit_score
-    lines.append(
-        f"- **Ground truth (leaderboard) score:** {score!r}"
-        if score is not None
-        else "- **Ground truth (leaderboard) score:** _(not returned or pending)_"
-    )
-    gp = entry.git_provenance or {}
-    if gp.get("revision_full"):
-        lines.append(f"- **Git revision (full):** `{gp['revision_full']}`")
-    if gp.get("revision_short"):
-        lines.append(f"- **Git revision (short):** `{gp['revision_short']}`")
-    if gp.get("branch"):
-        lines.append(f"- **Branch:** `{gp['branch']}`")
-    if "working_tree_clean" in gp:
-        lines.append(f"- **Working tree clean:** `{gp['working_tree_clean']}`")
-    sa = entry.submission_artifact or {}
-    if sa:
-        lines.append(f"- **CSV (relative to competition folder):** `{sa.get('path', '')}`")
-        lines.append(f"- **CSV size (bytes):** {sa.get('size_bytes', '')}")
-        lines.append(f"- **CSV sha256:** `{sa.get('sha256', '')}`")
-    if entry.linked_checkpoint_id:
-        lines.append(
-            f"- **Linked `.mle_log.jsonl` checkpoint id:** `{entry.linked_checkpoint_id}`"
-        )
-    ar = entry.api_result or {}
-    if ar:
-        snippet = json.dumps(ar, ensure_ascii=False)
-        if len(snippet) > 800:
-            snippet = snippet[:800] + "…"
-        lines.append(f"- **API response (sanitized):** {snippet}")
-    return "\n".join(lines)
-
-
-def _checkpoint_session_extra(entry: LogEntry) -> str:
-    """Optional git snapshot for checkpoint session rows."""
-    gp = entry.git_provenance or {}
-    if not gp.get("git_available") and not gp.get("revision_short"):
-        return ""
-    lines = ["### Checkpoint provenance"]
-    if gp.get("revision_short"):
-        lines.append(f"- **Git (short):** `{gp['revision_short']}`")
-    if gp.get("branch"):
-        lines.append(f"- **Branch:** `{gp['branch']}`")
-    if "working_tree_clean" in gp:
-        lines.append(f"- **Working tree clean:** `{gp['working_tree_clean']}`")
-    return "\n".join(lines)
 
 
 def _print_test_summary(lines: list[str], problem_id: str, returncode: int,
@@ -843,6 +665,7 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     _install_gym_environment(workspace / problem_id, "swe")
+    _autostart_watcher(workspace / problem_id)
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -1336,6 +1159,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     _install_gym_environment(workspace / problem_id, "cr")
+    _autostart_watcher(workspace / problem_id)
 
     problem_dir = workspace / problem_id
 
@@ -1497,45 +1321,13 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
         _error(str(e))
 
     _install_gym_environment(workspace / competition_id, "mle")
-    _ensure_supervisor_assets_with_fallback(workspace / competition_id, competition_id, "mle")
-    _autostart_supervisor(workspace / competition_id)
+    _autostart_watcher(workspace / competition_id)
 
     click.echo(
         f"\nDataset downloaded to: {dest_path}\n"
         f"\nNext step: train your model and submit predictions with:\n"
         f"  aicodinggym mle submit {competition_id} -F your_predictions.csv"
     )
-
-
-@main.command("init-supervisors")
-@click.option("--workspace-dir", default=None, type=click.Path(),
-              help="Workspace directory. Defaults to configured workspace.")
-def init_supervisors(workspace_dir: str | None):
-    """Create supervisor assets for all existing problem directories."""
-    config = load_config()
-    workspace = _resolve_workspace(config, workspace_dir)
-    created_for = 0
-
-    for child in workspace.iterdir():
-        if not child.is_dir():
-            continue
-        if child.name.startswith("."):
-            continue
-        if (child / ".git").exists():
-            challenge = "swe"
-        elif (child / "data").exists():
-            challenge = "mle"
-        elif (child / "diff.patch").exists():
-            challenge = "cr"
-        else:
-            continue
-
-        if challenge == "mle":
-            ensure_supervisor_assets(child, child.name, challenge)
-            _autostart_supervisor(child)
-            created_for += 1
-
-    click.echo(f"Initialized supervisor assets for {created_for} MLE folder(s) in {workspace}.")
 
 
 @mle.command("submit")
@@ -1597,113 +1389,6 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     score_msg = result.get("message", "Submission received for scoring.")
     score = result.get("score")
 
-    # Enhanced logging: try to infer model/params/benchmark from experiment log
-    workspace = _resolve_workspace(config, None)
-    comp_dir = workspace / competition_id
-    model = None
-    params = None
-    val_score = None
-    val_metric_name: str | None = None
-    log = None
-    if comp_dir.exists():
-        log = ExperimentLog(comp_dir)
-        entries = log.load()
-        # Try to find the most recent experiment log entry with a val_score
-        best_entry: LogEntry | None = None
-        for e in reversed(entries):
-            if e.val_score and e.model:
-                best_entry = e
-                break
-        if best_entry:
-            model = best_entry.model
-            params = best_entry.hyperparams
-            val_score = best_entry.val_score.get("value") if best_entry.val_score else None
-            val_metric_name = (
-                best_entry.val_score.get("metric") if best_entry.val_score else None
-            )
-        # Log submission with all details (git/CSV/API provenance)
-        entry = log.create_entry(
-            summary=message or f"Submit {csv_src.name}",
-            submit_score=score,
-            model=model,
-            val_metric=val_metric_name,
-            val_score=val_score,
-            hyperparams=params,
-            working_dir=comp_dir,
-            event_type="platform_submission",
-            linked_checkpoint_id=best_entry.id if best_entry else None,
-            api_result=result if isinstance(result, dict) else None,
-            csv_path=csv_src,
-        )
-        log.append(entry)
-        # gym_log.json — submission row with leaderboard score (delta vs prior GT)
-        try:
-            gt_score: float | None
-            if score is None:
-                gt_score = None
-            else:
-                try:
-                    gt_score = float(score)
-                except (TypeError, ValueError):
-                    gt_score = None
-            per_gym: dict[str, float] = {}
-            if model and val_score is not None:
-                try:
-                    per_gym[str(model)] = float(val_score)
-                except (TypeError, ValueError):
-                    pass
-            gym_session_log_entry(
-                entry_type="submission",
-                change_summary=message or f"Submit {csv_src.name}",
-                models_used=[str(model)] if model else [],
-                per_model_accuracy=per_gym,
-                ground_truth_accuracy=gt_score,
-                log_path=comp_dir / "gym_log.json",
-                provenance=_gym_provenance_from_log_entry(entry),
-                experiment_log_entry_id=entry.id,
-            )
-        except Exception:
-            pass
-        # Session log update (do not treat `-m` as a "user prompt" - it is optional metadata)
-        try:
-            session_logger = SessionLogger(
-                comp_dir, agent=_session_log_agent_name(), challenge_type="MLE-bench"
-            )
-            files_touched = list(entry.files_changed)
-            if not files_touched:
-                files_touched = _submission_csv_relative_to_comp(csv_src, comp_dir)
-            approach_parts = [
-                f"Submitted `{csv_src.name}` for leaderboard scoring.",
-            ]
-            if model:
-                approach_parts.append(f"Latest `.mle_log.jsonl` checkpoint uses model `{model}`.")
-            if val_score is not None:
-                approach_parts.append(f"Local validation score recorded there: {val_score!r}.")
-            if params:
-                approach_parts.append("Hyperparameters were copied from that checkpoint.")
-            if not model and val_score is None:
-                approach_parts.append(
-                    "No experiment-log entry with both model and val score was found "
-                    "(run `aicodinggym mle log add --no-input -s \"...\" --author ai` after training)."
-                )
-            note = message.strip() if message and message.strip() else None
-            session_logger.append_entry(
-                user_prompt="_(Not from a chat — this entry was created by `aicodinggym mle submit`.)_",
-                approach=" ".join(approach_parts),
-                files_touched=files_touched,
-                outcome=(
-                    f"Leaderboard score: {score}"
-                    if score is not None
-                    else "Submitted (score not returned or pending)."
-                ),
-                cli_submit_message=note,
-                entry_kind="platform_submission",
-                extra_sections=_mle_platform_submission_session_extra(entry),
-                include_summary_footer=True,
-            )
-        except Exception as e:
-            _warn(f"Session log append failed: {e}")
-
     click.echo(
         f"\nSuccessfully submitted prediction for {competition_id}\n"
         f"\n"
@@ -1713,219 +1398,3 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     if score is not None:
         click.echo(f"  Score:   {score}\n")
     click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
-
-
-# ---------------------------------------------------------------------------
-# mle log — experiment logging subcommands
-# ---------------------------------------------------------------------------
-
-@mle.group("log")
-def mle_log():
-    """Experiment log — track model changes and scores.
-
-    \b
-    COMMANDS:
-      add     Log a checkpoint (model change, val score, etc.)
-      show    Display the experiment timeline
-      export  Export log to CSV or Markdown
-    """
-    pass
-
-
-@mle_log.command("add")
-@click.argument("competition_id")
-@click.option("--summary", "-s", default=None, help="One-line description of what changed.")
-@click.option("--model", default=None, help="Model name (e.g. XGBoost, HGB).")
-@click.option("--val-metric", default=None, help="Validation metric name (e.g. balanced_accuracy).")
-@click.option("--val-score", default=None, type=float, help="Validation score value.")
-@click.option("--author", default=None, type=click.Choice(["human", "ai"]), help="Who made this change.")
-@click.option("--hyperparams", default=None, help="JSON string of hyperparameters.")
-@click.option("--tags", default=None, help="Comma-separated tags.")
-@click.option(
-    "--no-input",
-    is_flag=True,
-    help="Non-interactive: require -s/--summary; never prompt (for agents/CI).",
-)
-@click.option(
-    "--workspace-dir", default=None, type=click.Path(),
-    help="Workspace directory. Defaults to configured workspace.",
-)
-def mle_log_add(
-    competition_id: str,
-    summary: str | None,
-    model: str | None,
-    val_metric: str | None,
-    val_score: float | None,
-    author: str | None,
-    hyperparams: str | None,
-    tags: str | None,
-    no_input: bool,
-    workspace_dir: str | None,
-):
-    """Log a checkpoint entry for an MLE-bench competition.
-
-    Agents should pass ``-s``/``--summary`` and ``--no-input`` so nothing is prompted.
-
-    \b
-    EXAMPLES:
-      aicodinggym mle log add irrigation-s6e4 --summary "HGB baseline" --val-score 0.965
-      aicodinggym mle log add irrigation-s6e4 -s "XGB tuning" --model XGBoost --author ai --no-input
-    """
-    config = load_config()
-    workspace = _resolve_workspace(config, workspace_dir)
-    comp_dir = workspace / competition_id
-
-    if not comp_dir.exists():
-        _error(f"Competition directory not found: {comp_dir}")
-
-    explicit_summary = summary is not None
-    if no_input and not explicit_summary:
-        _error("--summary / -s is required with --no-input.")
-    if not explicit_summary:
-        if not sys.stdin.isatty():
-            _error("Missing --summary / -s (non-interactive stdin).")
-        summary = click.prompt("Summary (what changed)")
-
-    skip_prompts = explicit_summary or no_input
-    if skip_prompts:
-        if val_score is not None and not val_metric:
-            val_metric = val_metric or "accuracy"
-    else:
-        if not model:
-            model = click.prompt("Model name", default="", show_default=False) or None
-        if val_score is None:
-            val_str = click.prompt("Val score", default="", show_default=False)
-            if val_str:
-                try:
-                    val_score = float(val_str)
-                except ValueError:
-                    _warn(f"Invalid val score '{val_str}', skipping.")
-        if val_score is not None and not val_metric:
-            val_metric = click.prompt("Val metric", default="accuracy")
-
-    hp = None
-    if hyperparams:
-        try:
-            hp = json.loads(hyperparams)
-        except json.JSONDecodeError:
-            _warn(f"Invalid JSON for hyperparams, skipping.")
-    elif not skip_prompts:
-        hp_str = click.prompt("Hyperparams (JSON)", default="", show_default=False)
-        if hp_str:
-            try:
-                hp = json.loads(hp_str)
-            except json.JSONDecodeError:
-                _warn("Invalid JSON, skipping.")
-
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-    if not tags and not skip_prompts:
-        tags_str = click.prompt("Tags (comma-separated)", default="", show_default=False)
-        if tags_str:
-            tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
-
-    log = ExperimentLog(comp_dir)
-    entry = log.create_entry(
-        summary=summary,
-        author=author,
-        model=model,
-        val_metric=val_metric,
-        val_score=val_score,
-        hyperparams=hp,
-        tags=tag_list,
-        working_dir=comp_dir,
-        event_type="checkpoint",
-    )
-    log.append(entry)
-    # Session log update (`--summary` is a checkpoint note, not a chat transcript)
-    try:
-        session_logger = SessionLogger(
-            comp_dir, agent=_session_log_agent_name(), challenge_type="MLE-bench"
-        )
-        ap_parts = [f"**Checkpoint:** {summary}"]
-        if model:
-            ap_parts.append(f"Model `{model}`.")
-        if val_score is not None and val_metric:
-            ap_parts.append(f"Val ({val_metric}): {val_score!r}.")
-        elif val_score is not None:
-            ap_parts.append(f"Val: {val_score!r}.")
-        if hp:
-            ap_parts.append(f"Hyperparams: {hp!r}.")
-        ck_extra = _checkpoint_session_extra(entry)
-        session_logger.append_entry(
-            user_prompt="_(Not from a chat — this entry was created by `aicodinggym mle log add`.)_",
-            approach=" ".join(ap_parts),
-            files_touched=entry.files_changed,
-            outcome="Appended to `.mle_log.jsonl`.",
-            entry_kind="checkpoint",
-            extra_sections=ck_extra if ck_extra else None,
-            include_summary_footer=True,
-        )
-    except Exception as e:
-        _warn(f"Session log append failed: {e}")
-    click.echo(f"Logged: #{len(log.load())} — {summary}")
-
-
-@mle_log.command("show")
-@click.argument("competition_id")
-@click.option("-n", "last_n", default=None, type=int, help="Show only the last N entries.")
-@click.option("--expand", is_flag=True, help="Expand all entries with full details.")
-@click.option(
-    "--workspace-dir", default=None, type=click.Path(),
-    help="Workspace directory. Defaults to configured workspace.",
-)
-def mle_log_show(competition_id: str, last_n: int | None, expand: bool,
-                 workspace_dir: str | None):
-    """Display the experiment timeline for an MLE-bench competition.
-
-    \b
-    EXAMPLES:
-      aicodinggym mle log show irrigation-s6e4
-      aicodinggym mle log show irrigation-s6e4 -n 5
-      aicodinggym mle log show irrigation-s6e4 --expand
-    """
-    config = load_config()
-    workspace = _resolve_workspace(config, workspace_dir)
-    comp_dir = workspace / competition_id
-
-    if not comp_dir.exists():
-        _error(f"Competition directory not found: {comp_dir}")
-
-    log = ExperimentLog(comp_dir)
-    click.echo(log.render_timeline(last_n=last_n, expand_all=expand))
-
-
-@mle_log.command("export")
-@click.argument("competition_id")
-@click.option("--format", "fmt", default="csv", type=click.Choice(["csv", "md"]),
-              help="Export format (csv or md).")
-@click.option(
-    "--workspace-dir", default=None, type=click.Path(),
-    help="Workspace directory. Defaults to configured workspace.",
-)
-def mle_log_export(competition_id: str, fmt: str, workspace_dir: str | None):
-    """Export the experiment log to CSV or Markdown.
-
-    \b
-    EXAMPLES:
-      aicodinggym mle log export irrigation-s6e4
-      aicodinggym mle log export irrigation-s6e4 --format md
-    """
-    config = load_config()
-    workspace = _resolve_workspace(config, workspace_dir)
-    comp_dir = workspace / competition_id
-
-    if not comp_dir.exists():
-        _error(f"Competition directory not found: {comp_dir}")
-
-    log = ExperimentLog(comp_dir)
-    entries = log.load()
-    if not entries:
-        click.echo("No experiment log entries found.")
-        return
-
-    ext = "csv" if fmt == "csv" else "md"
-    out_path = comp_dir / f"{competition_id}_experiment_log.{ext}"
-
-    content = log.export_csv() if fmt == "csv" else log.export_markdown()
-    out_path.write_text(content, encoding="utf-8")
-    click.echo(f"Exported {len(entries)} entries to {out_path}")
