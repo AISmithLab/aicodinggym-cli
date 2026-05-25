@@ -46,8 +46,10 @@ from .api import (
     mlebench_download_file,
     mlebench_download_info,
     mlebench_submit_csv,
+    notify_mle_progress,
     submit_notification,
 )
+from .cli_env import read_solution_log_model, resolve as resolve_env
 from .config import (
     load_config,
     load_credentials,
@@ -692,8 +694,21 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     "--workspace-dir", default=None, type=click.Path(),
     help="Workspace directory. Overrides configured/cached value.",
 )
+@click.option(
+    "--tool", default=None,
+    help="Override detected coding tool (e.g. claude-code, cursor, antigravity).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Override detected tool version string.",
+)
+@click.option(
+    "--ai-model", default=None,
+    help="Override detected AI model (e.g. opus-4.7, gpt-5, gemini-2.5-pro).",
+)
 def swe_submit(problem_id: str, user_id: str | None, message: str | None,
-               force: bool, workspace_dir: str | None):
+               force: bool, workspace_dir: str | None,
+               tool: str | None, tool_version: str | None, ai_model: str | None):
     """Submit your SWE-bench solution by committing and pushing changes.
 
     Stages all changes, commits them, pushes to the remote, and notifies
@@ -763,6 +778,8 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
     if not success:
         _error(msg)
 
+    env = resolve_env(tool, tool_version, ai_model)
+
     # Notify backend
     try:
         submit_notification(
@@ -772,13 +789,24 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
             branch=branch,
             commit_message=commit_msg,
             timestamp=datetime.now().isoformat(),
+            **env,
         )
     except APIError as e:
         _warn(f"Changes pushed, but failed to notify backend: {e}")
 
+    tool_line = ""
+    if env["tool"] or env["ai_model"]:
+        bits = []
+        if env["tool"]:
+            bits.append(env["tool"] + (f" {env['tool_version']}" if env["tool_version"] else ""))
+        if env["ai_model"]:
+            bits.append(f"model={env['ai_model']}")
+        tool_line = f"  Tool:    {' · '.join(bits)}\n"
+
     click.echo(
         f"\nSuccessfully submitted solution for {problem_id}\n"
         f"\n"
+        f"{tool_line}"
         f"  Commit:  {commit_hash[:8]}\n"
         f"  Branch:  {branch}\n"
         f"  Status:  Pushed and backend notified\n"
@@ -1210,8 +1238,21 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     "-m", "--message", "review_text",
     help="Inline review text.",
 )
+@click.option(
+    "--tool", default=None,
+    help="Override detected coding tool (e.g. claude-code, cursor, antigravity).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Override detected tool version string.",
+)
+@click.option(
+    "--ai-model", default=None,
+    help="Override detected AI model (e.g. opus-4.7, gpt-5, gemini-2.5-pro).",
+)
 def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
-              review_text: str | None):
+              review_text: str | None,
+              tool: str | None, tool_version: str | None, ai_model: str | None):
     """Submit a code review for a Code Review challenge.
 
     Reads your review from a file (-f), inline text (-m), or piped stdin,
@@ -1250,14 +1291,25 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
             f"  aicodinggym cr submit {problem_id} -f review.md"
         )
 
+    env = resolve_env(tool, tool_version, ai_model)
     try:
-        result = cr_submit_review(uid, problem_id, review.strip())
+        result = cr_submit_review(uid, problem_id, review.strip(), **env)
     except APIError as e:
         _error(str(e))
+
+    tool_line = ""
+    if env["tool"] or env["ai_model"]:
+        bits = []
+        if env["tool"]:
+            bits.append(env["tool"] + (f" {env['tool_version']}" if env["tool_version"] else ""))
+        if env["ai_model"]:
+            bits.append(f"model={env['ai_model']}")
+        tool_line = f"  Tool:    {' · '.join(bits)}\n"
 
     click.echo(
         f"\nSuccessfully submitted code review for {problem_id}\n"
         f"\n"
+        f"{tool_line}"
         f"  Status:  {result.get('status', 'COMPLETED')}\n"
         f"\n"
         f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/cr/{problem_id}')}"
@@ -1341,8 +1393,21 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
     "--message", "-m", default=None,
     help="Description of your submission (optional).",
 )
+@click.option(
+    "--tool", default=None,
+    help="Override detected coding tool (e.g. claude-code, cursor, antigravity).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Override detected tool version string.",
+)
+@click.option(
+    "--ai-model", default=None,
+    help="Override detected AI model (e.g. opus-4.7, gpt-5, gemini-2.5-pro).",
+)
 def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
-               message: str | None):
+               message: str | None,
+               tool: str | None, tool_version: str | None, ai_model: str | None):
     """Submit a prediction CSV for an MLE-bench competition.
 
     Uploads your prediction CSV directly to the AI Coding Gym server
@@ -1378,23 +1443,47 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
 
     csv_src = Path(csv_path).resolve()
 
+    # solution_log.json (per CLAUDE.md) is the most accurate model record for MLE
+    log_model = read_solution_log_model(csv_src.parent)
+    env = resolve_env(tool, tool_version, ai_model or log_model)
+
     click.echo(f"Uploading {csv_src.name} for '{competition_id}'...")
 
     try:
-        result = mlebench_submit_csv(uid, competition_id, str(csv_src))
+        result = mlebench_submit_csv(uid, competition_id, str(csv_src), **env)
     except APIError as e:
         _error(str(e))
 
-
     score_msg = result.get("message", "Submission received for scoring.")
     score = result.get("score")
+    percentile = result.get("leaderboard_percentile")
+
+    # Forward percentile + attribution to the Prisma backend so the leaderboard
+    # aggregator can rank tools/models. Fire-and-forget — never fail the submit.
+    if percentile is not None:
+        try:
+            notify_mle_progress(uid, competition_id, float(percentile), **env)
+        except APIError as e:
+            _warn(f"Submitted, but failed to log progress: {e}")
+
+    tool_line = ""
+    if env["tool"] or env["ai_model"]:
+        bits = []
+        if env["tool"]:
+            bits.append(env["tool"] + (f" {env['tool_version']}" if env["tool_version"] else ""))
+        if env["ai_model"]:
+            bits.append(f"model={env['ai_model']}")
+        tool_line = f"  Tool:    {' · '.join(bits)}\n"
 
     click.echo(
         f"\nSuccessfully submitted prediction for {competition_id}\n"
         f"\n"
+        f"{tool_line}"
         f"  CSV:     {csv_src.name}\n"
         f"  Status:  {score_msg}\n"
     )
     if score is not None:
         click.echo(f"  Score:   {score}\n")
+    if percentile is not None:
+        click.echo(f"  Top %:   {percentile}\n")
     click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
