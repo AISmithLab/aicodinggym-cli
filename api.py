@@ -76,8 +76,11 @@ def fetch_problem(user_id: str, problem_id: str) -> dict:
 
 
 def submit_notification(problem_id: str, user_id: str, commit_hash: str,
-                        branch: str, commit_message: str, timestamp: str) -> dict:
-    """Notify backend of a submission."""
+                        branch: str, commit_message: str, timestamp: str,
+                        tool: str | None = None,
+                        tool_version: str | None = None,
+                        ai_model: str | None = None) -> dict:
+    """Notify backend of a SWE submission, optionally attributing the tool/model used."""
     return _post("submissions", {
         "problem_id": problem_id,
         "user_id": user_id,
@@ -85,6 +88,9 @@ def submit_notification(problem_id: str, user_id: str, commit_hash: str,
         "branch": branch,
         "commit_message": commit_message,
         "timestamp": timestamp,
+        "tool": tool,
+        "tool_version": tool_version,
+        "ai_model": ai_model,
     })
 
 
@@ -93,18 +99,73 @@ def fetch_pr(user_id: str, problem_id: str) -> dict:
     return _post("code-review-fetch", {"user_id": user_id, "problem_id": problem_id})
 
 
-def cr_submit_review(user_id: str, problem_id: str, review: str) -> dict:
+def cr_submit_review(user_id: str, problem_id: str, review: str,
+                     tool: str | None = None,
+                     tool_version: str | None = None,
+                     ai_model: str | None = None) -> dict:
     """Submit a code review."""
     return _post("code-review-submit", {
         "user_id": user_id,
         "problem_id": problem_id,
         "review": review,
+        "tool": tool,
+        "tool_version": tool_version,
+        "ai_model": ai_model,
     })
 
 
+def notify_mle_progress(user_id: str, problem_slug: str, best_percentile: float,
+                        tool: str | None = None,
+                        tool_version: str | None = None,
+                        ai_model: str | None = None) -> dict:
+    """After an MLE-bench grade is returned, log tool/model attribution and
+    bestPercentile against the Prisma UserProgress row so the leaderboard
+    aggregator can pick it up."""
+    payload = {
+        "problemSlug": problem_slug,
+        "status": "solved",
+        "bestPercentile": best_percentile,
+        "tool": tool,
+        "tool_version": tool_version,
+        "ai_model": ai_model,
+    }
+    return _post(f"users/{user_id}/progress", payload)
+
+
 def mlebench_download_info(user_id: str, competition_id: str, dest_path: str) -> None:
-    """Download dataset for an MLE-bench competition directly to dest_path."""
-    resp = _get(f"competitions/{competition_id}/download", stream=True)
+    """Download dataset for an MLE-bench competition directly to dest_path.
+
+    Uses a long read timeout: large zips can take many minutes between chunks
+    over slow links; the default 30s read timeout would abort mid-stream.
+    """
+    read_s = int(os.environ.get("AICODINGGYM_DOWNLOAD_READ_TIMEOUT", "0"))
+    if read_s <= 0:
+        read_s = 7200  # seconds between reads; large zips need headroom
+    url = f"{API_BASE}/competitions/{competition_id}/download"
+    try:
+        resp = requests.get(
+            url,
+            stream=True,
+            timeout=(120, read_s),
+        )
+        resp.raise_for_status()
+    except requests.ConnectionError:
+        raise APIError(
+            f"Cannot connect to {API_BASE}.\n"
+            "Check your internet connection and try again."
+        )
+    except requests.Timeout:
+        raise APIError(f"Download from {url} timed out.")
+    except requests.HTTPError as e:
+        body = ""
+        try:
+            body = e.response.json().get("detail", e.response.text)
+        except Exception:
+            body = e.response.text
+        raise APIError(f"API error (HTTP {e.response.status_code}): {body}")
+    except requests.RequestException as e:
+        raise APIError(f"Request failed: {e}")
+
     with open(dest_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
@@ -122,15 +183,50 @@ def mlebench_download_file(url: str, dest_path: str, timeout: int = 300) -> None
         raise APIError(f"Download failed: {e}")
 
 
-def mlebench_submit_csv(user_id: str, competition_id: str, csv_path: str) -> dict:
+def record_mle_submission(user_id: str, competition_id: str,
+                          score: float | None,
+                          percentile: float | None,
+                          status: str,
+                          csv_name: str | None = None,
+                          error: str | None = None,
+                          tool: str | None = None,
+                          tool_version: str | None = None,
+                          ai_model: str | None = None) -> dict:
+    """Persist an MLE-bench grading result as a Prisma Submission row so the
+    main DB has per-attempt history with tool/model attribution."""
+    return _post("mle-submission", {
+        "user_id": user_id,
+        "competition_id": competition_id,
+        "score": score,
+        "percentile": percentile,
+        "status": status,
+        "csv_name": csv_name,
+        "error": error,
+        "tool": tool,
+        "tool_version": tool_version,
+        "ai_model": ai_model,
+    })
+
+
+def mlebench_submit_csv(user_id: str, competition_id: str, csv_path: str,
+                        tool: str | None = None,
+                        tool_version: str | None = None,
+                        ai_model: str | None = None) -> dict:
     """Upload a prediction CSV for an MLE-bench competition."""
     try:
         csv_name = Path(csv_path).name
         with open(csv_path, "rb") as f:
             compressed = gzip.compress(f.read())
+        form = {
+            "user_id": user_id,
+            "competition_id": competition_id,
+            "tool": tool or "",
+            "tool_version": tool_version or "",
+            "ai_model": ai_model or "",
+        }
         resp = requests.post(
             f"{API_BASE}/competitions/{competition_id}/submit",
-            data={"user_id": user_id, "competition_id": competition_id},
+            data=form,
             files={"file": (csv_name + ".gz", compressed, "application/gzip")},
             timeout=120,
         )

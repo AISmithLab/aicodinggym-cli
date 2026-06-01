@@ -1,6 +1,25 @@
+﻿# Runtime artifacts
+.supervisor.log
+.supervisor.lock
+.supervisor_snapshot/
+.logger_runs/
+.log/
+.mle_log.jsonl
+gym_log.json
+
+# Python/editor cruft
 __pycache__/
-*.egg-info/
-dist/
-build/
-.DS_Store
 *.pyc
+.DS_Store
+
+# gym-environment
+.claudeignore
+.copilotignore
+.cursorignore
+.cursorrules
+.geminiignore
+.github
+.gitignore
+AGENTS.md
+CLAUDE.md
+GEMINI.md

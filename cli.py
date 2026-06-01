@@ -28,9 +28,11 @@ import platform
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -44,11 +46,18 @@ from .api import (
     mlebench_download_file,
     mlebench_download_info,
     mlebench_submit_csv,
+    notify_mle_progress,
+    record_mle_submission,
     submit_notification,
 )
+from .cli_env import read_solution_log_model, resolve as resolve_env
 from .config import (
+    ATTRIBUTION_PATH,
+    clear_attribution,
+    load_attribution,
     load_config,
     load_credentials,
+    save_attribution,
     save_config,
     save_credentials,
 )
@@ -80,14 +89,50 @@ def _warn(msg: str) -> None:
     click.echo(f"Warning: {msg}", err=True)
 
 
-_GYM_ENV_API = "https://api.github.com/repos/AICodingGym/gym-environment/contents"
 _GYM_ENV_SKIP = {"README.md"}
+_GYM_ENV_MLE_ONLY: set[str] = set()
 
 
-def _install_gym_environment(dest: Path) -> None:
-    """Download gym-environment files into dest and add them to .gitignore."""
+def _gym_env_repo() -> str:
+    """GitHub ``owner/repo`` for gym-environment assets (override with env)."""
+    return os.environ.get("AICODINGGYM_GYM_ENV_REPO", "").strip() or "AICodingGym/gym-environment"
+
+
+def _gym_env_ref() -> str:
+    """Git ref (branch, tag, or commit) for Contents API ``?ref=``.
+
+    If ``AICODINGGYM_GYM_ENV_REF`` is unset or empty, defaults to ``test`` so
+    fetched problems get the same supervisor/dashboard stack as CI/staging.
+    Set ``AICODINGGYM_GYM_ENV_REF=main`` (or another branch) to override.
+    """
+    ref = os.environ.get("AICODINGGYM_GYM_ENV_REF", "")
+    ref = ref.strip()
+    if ref:
+        return ref
+    return "test"
+
+
+def _gym_env_contents_api_url(subpath: str = "") -> str:
+    """GitHub Contents API URL for gym-environment at the configured ref."""
+    base = f"https://api.github.com/repos/{_gym_env_repo()}/contents"
+    subpath = subpath.strip("/")
+    if subpath:
+        base = f"{base}/{subpath}"
+    ref = _gym_env_ref()
+    return f"{base}?ref={ref}"
+
+
+def _install_gym_environment(dest: Path, challenge: str | None = None) -> None:
+    """Download gym-environment files from GitHub into dest and add to .gitignore.
+
+    Ref and repo are configurable via ``AICODINGGYM_GYM_ENV_REF`` and
+    ``AICODINGGYM_GYM_ENV_REPO``. When ref is unset, the ``test`` branch is used.
+    """
     try:
-        req = urllib.request.Request(_GYM_ENV_API, headers={"Accept": "application/vnd.github.v3+json"})
+        req = urllib.request.Request(
+            _gym_env_contents_api_url(),
+            headers={"Accept": "application/vnd.github.v3+json"},
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             entries = json.loads(resp.read())
     except Exception as e:
@@ -117,7 +162,7 @@ def _install_gym_environment(dest: Path) -> None:
             # Fetch subdirectory contents recursively (one level deep)
             try:
                 sub_req = urllib.request.Request(
-                    f"{_GYM_ENV_API}/{name}",
+                    _gym_env_contents_api_url(name),
                     headers={"Accept": "application/vnd.github.v3+json"},
                 )
                 with urllib.request.urlopen(sub_req, timeout=15) as r:
@@ -140,19 +185,117 @@ def _install_gym_environment(dest: Path) -> None:
                     _warn(f"Failed to download {name}/{sub_name}: {e}")
             downloaded.append(name)
 
-    if not downloaded:
-        return
+    # Seed empty solution_log.json if absent (AI agent populates it after each prompt)
+    log_file = dest / "solution_log.json"
+    if not log_file.exists():
+        log_file.write_text(
+            '{"version": "1.0", "problem": "", "problem_type": "mle", "prompts": []}\n',
+            encoding="utf-8",
+        )
 
     # Append to .gitignore
     gitignore = dest / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     existing_lines = set(existing.splitlines())
-    new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
-    if new_entries:
-        block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
-        with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
-            fh.write(block)
+    gym_artifacts = [".gym_watcher.lock", ".gym_watcher.log", "solution_log.json", ".dashboard.tmp", ".gym_attribution.json"]
+    if downloaded:
+        new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
+        new_entries += [a for a in gym_artifacts if a not in existing_lines and f"/{a}" not in existing_lines]
+        if new_entries:
+            block = "\n# gym-environment\n" + "\n".join(new_entries) + "\n"
+            with open(gitignore, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(block)
 
+
+def _open_in_browser(path: Path) -> bool:
+    """Best-effort open a local file in the user's default browser.
+
+    Returns True if the open call was dispatched, False otherwise. Never
+    raises - a missing display / headless box should not break ``fetch``.
+    """
+    try:
+        if not path.exists():
+            # Create a minimal placeholder so the browser has something to load;
+            # the watcher will overwrite it moments later.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("<!doctype html><title>AI Coding Gym</title><p>Preparing dashboard\u2026</p>", encoding="utf-8")
+        import webbrowser
+        return bool(webbrowser.open(path.resolve().as_uri()))
+    except Exception:
+        return False
+
+
+def _autostart_watcher(problem_dir: Path) -> None:
+    """Launch gym_watcher.py in background inside problem_dir. Non-fatal."""
+    problem_dir = Path(problem_dir)
+    watcher = problem_dir / "gym_watcher.py"
+    if not watcher.exists():
+        return
+    lock = problem_dir / ".gym_watcher.lock"
+    if lock.exists():
+        try:
+            pid = int(lock.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid and _pid_alive(pid):
+            click.echo("Gym watcher already running; skipping auto-start.")
+            return
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    log_path = problem_dir / ".gym_watcher.log"
+    try:
+        cmd = [sys.executable, str(watcher), str(problem_dir)]
+        log_fh = open(log_path, "ab", buffering=0)
+        kwargs: dict[str, Any] = {
+            "stdout": log_fh,
+            "stderr": log_fh,
+            "stdin": subprocess.DEVNULL,
+            "cwd": str(problem_dir),
+        }
+        if platform.system() == "Windows":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            kwargs["close_fds"] = False
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)  # type: ignore[arg-type]
+        dashboard = problem_dir / "dashboard.html"
+        opened = _open_in_browser(dashboard)
+        msg = "Gym watcher started (logs: .gym_watcher.log)."
+        if not opened:
+            msg += f" Open {dashboard} to view dashboard."
+        click.echo(msg)
+    except Exception as exc:
+        _warn(f"Could not auto-start gym_watcher.py: {exc}.")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform ``kill(0)`` equivalent."""
+    try:
+        if platform.system() == "Windows":
+            # ``tasklist`` is universally available on Windows; short-circuit via signal.
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            return str(pid) in out.stdout
+        else:
+            os.kill(pid, 0)
+            return True
+    except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _shquote(text: str) -> str:
+    """Minimal POSIX-shell quoting sufficient for paths used by the autostart shim."""
+    if not text:
+        return "''"
+    if all(ch.isalnum() or ch in "@%+=:,./-_" for ch in text):
+        return text
+    return "'" + text.replace("'", "'\"'\"'") + "'"
 
 
 def _resolve_user_id(config: dict, user_id: str | None) -> str:
@@ -430,6 +573,123 @@ def configure(user_id: str, workspace_dir: str | None):
         _error(f"Configuration failed: {e}")
 
 
+# ── attribution commands ─────────────────────────────────────────────────────
+
+
+def _require_attribution(env: dict[str, Any], submit_cmd: str, problem_id: str) -> None:
+    """Hard-reject a submission that lacks tool + model attribution.
+
+    Both fields must resolve (via live detection, ``.gym_attribution.json``,
+    flags, or persisted config) or the row would land on the leaderboard with
+    no attribution — defeating the purpose. On failure, print a copy-paste
+    block the user can hand to their AI IDE to self-report and resubmit, then
+    exit non-zero.
+
+    ``submit_cmd`` is the subcommand path, e.g. ``"swe submit"``.
+    """
+    missing = [label for label, key in (("tool", "tool"), ("model", "ai_model")) if not env.get(key)]
+    if not missing:
+        return
+
+    full_cmd = f"aicodinggym {submit_cmd} {problem_id}"
+    rule = "-" * 60
+    _error(
+        f"Submission rejected - missing {' and '.join(missing)} attribution.\n\n"
+        f"The leaderboard must know which AI tool and model produced this\n"
+        f"solution. Nothing was auto-detected and no .gym_attribution.json was\n"
+        f"found in the problem folder.\n\n"
+        f"Paste this into your AI IDE / agent to log attribution and resubmit:\n"
+        f"{rule}\n"
+        f"Create a file named .gym_attribution.json in the {problem_id}\n"
+        f"problem folder, filling in your real tool and model:\n\n"
+        f"{{\n"
+        f'  \"tool\": \"<your tool, e.g. cursor | aider | gemini-cli>\",\n'
+        f'  \"tool_version\": \"<optional, e.g. 0.42.3>\",\n'
+        f'  \"ai_model\": \"<your model, e.g. gpt-5 | gemini-2.5-pro>\"\n'
+        f"}}\n\n"
+        f"Then run: {full_cmd}\n"
+        f"{rule}\n\n"
+        f"Alternatives (no file needed):\n"
+        f"  * One-off:  {full_cmd} --tool <name> --ai-model <name>\n"
+        f"  * Persist:  aicodinggym set-attribution --tool <name> --model <name>"
+    )
+
+
+@main.command("set-attribution")
+@click.option(
+    "--tool", default=None,
+    help="Coding tool name (e.g. claude-code, cursor, aider, codex-cli).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Optional version string for the tool.",
+)
+@click.option(
+    "--model", "ai_model", default=None,
+    help="AI model identifier (e.g. claude-opus-4-7, gpt-5, gemini-2.5-pro).",
+)
+def set_attribution(tool: str | None, tool_version: str | None, ai_model: str | None):
+    """Persist tool/model attribution used as the reliable fallback when
+    auto-detection cannot identify the current session.
+
+    Every subsequent submission picks up these values automatically unless
+    overridden by per-command flags (``--tool``, ``--tool-version``,
+    ``--ai-model``) or live auto-detection.
+
+    \b
+    EXAMPLE:
+      aicodinggym set-attribution --tool claude-code --model claude-opus-4-7
+      aicodinggym set-attribution --tool cursor --model claude-sonnet-4-5
+    """
+    if not any([tool, tool_version, ai_model]):
+        _error(
+            "Provide at least one of --tool, --tool-version, --model.\n\n"
+            "Example:\n"
+            "  aicodinggym set-attribution --tool claude-code --model claude-opus-4-7"
+        )
+
+    current = load_attribution()
+    if tool is not None:
+        current["tool"] = tool
+    if tool_version is not None:
+        current["tool_version"] = tool_version
+    if ai_model is not None:
+        current["ai_model"] = ai_model
+    save_attribution(current)
+
+    click.echo(
+        f"Saved attribution to {ATTRIBUTION_PATH}:\n"
+        f"  tool:          {current.get('tool') or '(unset)'}\n"
+        f"  tool_version:  {current.get('tool_version') or '(unset)'}\n"
+        f"  ai_model:      {current.get('ai_model') or '(unset)'}"
+    )
+
+
+@main.command("show-attribution")
+def show_attribution():
+    """Print the persisted attribution and the live auto-detected values."""
+    persisted = load_attribution()
+    resolved = resolve_env(None, None, None)
+    click.echo("Persisted attribution (~/.aicodinggym/attribution.json):")
+    click.echo(f"  tool:          {persisted.get('tool') or '(unset)'}")
+    click.echo(f"  tool_version:  {persisted.get('tool_version') or '(unset)'}")
+    click.echo(f"  ai_model:      {persisted.get('ai_model') or '(unset)'}")
+    click.echo("")
+    click.echo("Effective values for the next submission (auto-detect ∪ persisted):")
+    click.echo(f"  tool:          {resolved.get('tool') or '(none)'}")
+    click.echo(f"  tool_version:  {resolved.get('tool_version') or '(none)'}")
+    click.echo(f"  ai_model:      {resolved.get('ai_model') or '(none)'}")
+
+
+@main.command("clear-attribution")
+def clear_attribution_cmd():
+    """Remove the persisted attribution file."""
+    if clear_attribution():
+        click.echo(f"Removed {ATTRIBUTION_PATH}.")
+    else:
+        click.echo("No persisted attribution to remove.")
+
+
 # ── swe group ────────────────────────────────────────────────────────────────
 
 
@@ -528,7 +788,8 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
-    _install_gym_environment(workspace / problem_id)
+    _install_gym_environment(workspace / problem_id, "swe")
+    _autostart_watcher(workspace / problem_id)
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -555,8 +816,21 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     "--workspace-dir", default=None, type=click.Path(),
     help="Workspace directory. Overrides configured/cached value.",
 )
+@click.option(
+    "--tool", default=None,
+    help="Override detected coding tool (e.g. claude-code, cursor, antigravity).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Override detected tool version string.",
+)
+@click.option(
+    "--ai-model", default=None,
+    help="Override detected AI model (e.g. opus-4.7, gpt-5, gemini-2.5-pro).",
+)
 def swe_submit(problem_id: str, user_id: str | None, message: str | None,
-               force: bool, workspace_dir: str | None):
+               force: bool, workspace_dir: str | None,
+               tool: str | None, tool_version: str | None, ai_model: str | None):
     """Submit your SWE-bench solution by committing and pushing changes.
 
     Stages all changes, commits them, pushes to the remote, and notifies
@@ -620,6 +894,11 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
     branch = creds["branch"]
     commit_msg = message or f"Solution submission for {problem_id} at {datetime.now().isoformat()}"
 
+    # Resolve + enforce attribution BEFORE pushing, so a rejection leaves no
+    # side effects (nothing committed/pushed, backend not notified).
+    env = resolve_env(tool, tool_version, ai_model, problem_dir=problem_dir)
+    _require_attribution(env, "swe submit", problem_id)
+
     click.echo(f"Submitting solution for '{problem_id}'...")
     success, msg, commit_hash = add_commit_push(str(problem_dir), branch, key_path, commit_msg, force)
 
@@ -635,13 +914,24 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
             branch=branch,
             commit_message=commit_msg,
             timestamp=datetime.now().isoformat(),
+            **env,
         )
     except APIError as e:
         _warn(f"Changes pushed, but failed to notify backend: {e}")
 
+    tool_line = ""
+    if env["tool"] or env["ai_model"]:
+        bits = []
+        if env["tool"]:
+            bits.append(env["tool"] + (f" {env['tool_version']}" if env["tool_version"] else ""))
+        if env["ai_model"]:
+            bits.append(f"model={env['ai_model']}")
+        tool_line = f"  Tool:    {' · '.join(bits)}\n"
+
     click.echo(
         f"\nSuccessfully submitted solution for {problem_id}\n"
         f"\n"
+        f"{tool_line}"
         f"  Commit:  {commit_hash[:8]}\n"
         f"  Branch:  {branch}\n"
         f"  Status:  Pushed and backend notified\n"
@@ -1021,7 +1311,8 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
-    _install_gym_environment(workspace / problem_id)
+    _install_gym_environment(workspace / problem_id, "cr")
+    _autostart_watcher(workspace / problem_id)
 
     problem_dir = workspace / problem_id
 
@@ -1072,8 +1363,21 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     "-m", "--message", "review_text",
     help="Inline review text.",
 )
+@click.option(
+    "--tool", default=None,
+    help="Override detected coding tool (e.g. claude-code, cursor, antigravity).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Override detected tool version string.",
+)
+@click.option(
+    "--ai-model", default=None,
+    help="Override detected AI model (e.g. opus-4.7, gpt-5, gemini-2.5-pro).",
+)
 def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
-              review_text: str | None):
+              review_text: str | None,
+              tool: str | None, tool_version: str | None, ai_model: str | None):
     """Submit a code review for a Code Review challenge.
 
     Reads your review from a file (-f), inline text (-m), or piped stdin,
@@ -1112,14 +1416,27 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
             f"  aicodinggym cr submit {problem_id} -f review.md"
         )
 
+    cr_problem_dir = _resolve_workspace(config, None) / problem_id
+    env = resolve_env(tool, tool_version, ai_model, problem_dir=cr_problem_dir)
+    _require_attribution(env, "cr submit", problem_id)
     try:
-        result = cr_submit_review(uid, problem_id, review.strip())
+        result = cr_submit_review(uid, problem_id, review.strip(), **env)
     except APIError as e:
         _error(str(e))
+
+    tool_line = ""
+    if env["tool"] or env["ai_model"]:
+        bits = []
+        if env["tool"]:
+            bits.append(env["tool"] + (f" {env['tool_version']}" if env["tool_version"] else ""))
+        if env["ai_model"]:
+            bits.append(f"model={env['ai_model']}")
+        tool_line = f"  Tool:    {' · '.join(bits)}\n"
 
     click.echo(
         f"\nSuccessfully submitted code review for {problem_id}\n"
         f"\n"
+        f"{tool_line}"
         f"  Status:  {result.get('status', 'COMPLETED')}\n"
         f"\n"
         f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/cr/{problem_id}')}"
@@ -1182,7 +1499,8 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
     except APIError as e:
         _error(str(e))
 
-    _install_gym_environment(workspace / competition_id)
+    _install_gym_environment(workspace / competition_id, "mle")
+    _autostart_watcher(workspace / competition_id)
 
     click.echo(
         f"\nDataset downloaded to: {dest_path}\n"
@@ -1202,8 +1520,21 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
     "--message", "-m", default=None,
     help="Description of your submission (optional).",
 )
+@click.option(
+    "--tool", default=None,
+    help="Override detected coding tool (e.g. claude-code, cursor, antigravity).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Override detected tool version string.",
+)
+@click.option(
+    "--ai-model", default=None,
+    help="Override detected AI model (e.g. opus-4.7, gpt-5, gemini-2.5-pro).",
+)
 def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
-               message: str | None):
+               message: str | None,
+               tool: str | None, tool_version: str | None, ai_model: str | None):
     """Submit a prediction CSV for an MLE-bench competition.
 
     Uploads your prediction CSV directly to the AI Coding Gym server
@@ -1239,22 +1570,66 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
 
     csv_src = Path(csv_path).resolve()
 
+    # solution_log.json (per CLAUDE.md) is the most accurate model record for MLE
+    log_model = read_solution_log_model(csv_src.parent)
+    env = resolve_env(tool, tool_version, ai_model or log_model, problem_dir=csv_src.parent)
+    _require_attribution(env, "mle submit", competition_id)
+
     click.echo(f"Uploading {csv_src.name} for '{competition_id}'...")
 
     try:
-        result = mlebench_submit_csv(uid, competition_id, str(csv_src))
+        result = mlebench_submit_csv(uid, competition_id, str(csv_src), **env)
     except APIError as e:
         _error(str(e))
 
     score_msg = result.get("message", "Submission received for scoring.")
     score = result.get("score")
+    percentile = result.get("leaderboard_percentile")
+    grade_status = result.get("status") or ("graded" if score is not None else "invalid")
+    grade_error = result.get("error")
+
+    # Persist one Submission row per MLE upload (mirrors SWE/CR) so per-attempt
+    # history with tool/model attribution lands in Prisma even when grading
+    # fails. Fire-and-forget — never fail the submit if the call errors.
+    try:
+        record_mle_submission(
+            user_id=uid,
+            competition_id=competition_id,
+            score=score,
+            percentile=percentile,
+            status=grade_status,
+            csv_name=csv_src.name,
+            error=grade_error,
+            **env,
+        )
+    except APIError as e:
+        _warn(f"Submitted, but failed to record submission row: {e}")
+
+    # Also update UserProgress (best-percentile leaderboard view).
+    if percentile is not None:
+        try:
+            notify_mle_progress(uid, competition_id, float(percentile), **env)
+        except APIError as e:
+            _warn(f"Submitted, but failed to log progress: {e}")
+
+    tool_line = ""
+    if env["tool"] or env["ai_model"]:
+        bits = []
+        if env["tool"]:
+            bits.append(env["tool"] + (f" {env['tool_version']}" if env["tool_version"] else ""))
+        if env["ai_model"]:
+            bits.append(f"model={env['ai_model']}")
+        tool_line = f"  Tool:    {' · '.join(bits)}\n"
 
     click.echo(
         f"\nSuccessfully submitted prediction for {competition_id}\n"
         f"\n"
+        f"{tool_line}"
         f"  CSV:     {csv_src.name}\n"
         f"  Status:  {score_msg}\n"
     )
     if score is not None:
         click.echo(f"  Score:   {score}\n")
+    if percentile is not None:
+        click.echo(f"  Top %:   {percentile}\n")
     click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")

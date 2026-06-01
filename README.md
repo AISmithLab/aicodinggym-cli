@@ -54,7 +54,10 @@ aicodinggym configure --user-id USER_ID [--workspace-dir DIR]
 
 #### `aicodinggym swe fetch PROBLEM_ID`
 
-Fetch a problem and clone the repo locally.
+Fetch a problem and clone the repo locally. After a successful `swe fetch`, `mle download`, or `cr fetch`, the CLI downloads agent instruction files from [AICodingGym/gym-environment](https://github.com/AICodingGym/gym-environment) via the GitHub Contents API. By default it uses the **`test` branch**. Override with environment variables:
+
+- `AICODINGGYM_GYM_ENV_REPO` — `owner/repo` (default: `AICodingGym/gym-environment`)
+- `AICODINGGYM_GYM_ENV_REF` — branch, tag, or commit SHA for `?ref=` (default: `test` when unset)
 
 ```
 aicodinggym swe fetch PROBLEM_ID [--user-id ID] [--workspace-dir DIR]

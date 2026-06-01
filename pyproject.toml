@@ -1,6 +1,6 @@
 [project]
 name = "aicodinggym-cli"
-version = "0.5.1"
+version = "0.6.0"
 description = "CLI tool for AI Coding Gym platform"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,3 +37,7 @@ packages = ["aicodinggym"]
 
 [tool.setuptools.package-dir]
 aicodinggym = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
