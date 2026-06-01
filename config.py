@@ -16,9 +16,11 @@ from typing import Any
 CONFIG_DIR = Path.home() / ".aicodinggym"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
+ATTRIBUTION_PATH = CONFIG_DIR / "attribution.json"
 
 # Fields persisted in config.json
 _CONFIG_FIELDS = ("user_id", "repo_name", "private_key_path", "workspace_dir")
+_ATTRIBUTION_FIELDS = ("tool", "tool_version", "ai_model")
 
 
 def ensure_config_dir() -> Path:
@@ -78,6 +80,47 @@ def save_credentials(credentials: dict[str, dict[str, Any]]) -> None:
     """Persist per-problem credentials to ~/.aicodinggym/credentials.json."""
     ensure_config_dir()
     CREDENTIALS_PATH.write_text(json.dumps(credentials, indent=2) + "\n")
+
+
+def load_attribution() -> dict[str, str]:
+    """Load persistent tool/model attribution from ~/.aicodinggym/attribution.json.
+
+    Used as a reliable fallback when auto-detection cannot identify the
+    coding tool or model — set once via ``aicodinggym set-attribution`` and
+    every subsequent submission picks it up automatically.
+    """
+    if not ATTRIBUTION_PATH.exists():
+        return {}
+    try:
+        data = json.loads(ATTRIBUTION_PATH.read_text())
+        if not isinstance(data, dict):
+            return {}
+        return {
+            k: v.strip()
+            for k, v in data.items()
+            if k in _ATTRIBUTION_FIELDS and isinstance(v, str) and v.strip()
+        }
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_attribution(attribution: dict[str, str]) -> None:
+    """Persist attribution to ~/.aicodinggym/attribution.json."""
+    ensure_config_dir()
+    data = {
+        k: attribution[k].strip()
+        for k in _ATTRIBUTION_FIELDS
+        if isinstance(attribution.get(k), str) and attribution[k].strip()
+    }
+    ATTRIBUTION_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def clear_attribution() -> bool:
+    """Remove persistent attribution. Returns True if a file was deleted."""
+    if ATTRIBUTION_PATH.exists():
+        ATTRIBUTION_PATH.unlink()
+        return True
+    return False
 
 
 def require_config(config: dict[str, str], field: str, label: str) -> str:

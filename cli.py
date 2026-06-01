@@ -47,12 +47,17 @@ from .api import (
     mlebench_download_info,
     mlebench_submit_csv,
     notify_mle_progress,
+    record_mle_submission,
     submit_notification,
 )
 from .cli_env import read_solution_log_model, resolve as resolve_env
 from .config import (
+    ATTRIBUTION_PATH,
+    clear_attribution,
+    load_attribution,
     load_config,
     load_credentials,
+    save_attribution,
     save_config,
     save_credentials,
 )
@@ -192,7 +197,7 @@ def _install_gym_environment(dest: Path, challenge: str | None = None) -> None:
     gitignore = dest / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     existing_lines = set(existing.splitlines())
-    gym_artifacts = [".gym_watcher.lock", ".gym_watcher.log", "solution_log.json", ".dashboard.tmp"]
+    gym_artifacts = [".gym_watcher.lock", ".gym_watcher.log", "solution_log.json", ".dashboard.tmp", ".gym_attribution.json"]
     if downloaded:
         new_entries = [f for f in downloaded if f not in existing_lines and f"/{f}" not in existing_lines]
         new_entries += [a for a in gym_artifacts if a not in existing_lines and f"/{a}" not in existing_lines]
@@ -568,6 +573,123 @@ def configure(user_id: str, workspace_dir: str | None):
         _error(f"Configuration failed: {e}")
 
 
+# ── attribution commands ─────────────────────────────────────────────────────
+
+
+def _require_attribution(env: dict[str, Any], submit_cmd: str, problem_id: str) -> None:
+    """Hard-reject a submission that lacks tool + model attribution.
+
+    Both fields must resolve (via live detection, ``.gym_attribution.json``,
+    flags, or persisted config) or the row would land on the leaderboard with
+    no attribution — defeating the purpose. On failure, print a copy-paste
+    block the user can hand to their AI IDE to self-report and resubmit, then
+    exit non-zero.
+
+    ``submit_cmd`` is the subcommand path, e.g. ``"swe submit"``.
+    """
+    missing = [label for label, key in (("tool", "tool"), ("model", "ai_model")) if not env.get(key)]
+    if not missing:
+        return
+
+    full_cmd = f"aicodinggym {submit_cmd} {problem_id}"
+    rule = "-" * 60
+    _error(
+        f"Submission rejected - missing {' and '.join(missing)} attribution.\n\n"
+        f"The leaderboard must know which AI tool and model produced this\n"
+        f"solution. Nothing was auto-detected and no .gym_attribution.json was\n"
+        f"found in the problem folder.\n\n"
+        f"Paste this into your AI IDE / agent to log attribution and resubmit:\n"
+        f"{rule}\n"
+        f"Create a file named .gym_attribution.json in the {problem_id}\n"
+        f"problem folder, filling in your real tool and model:\n\n"
+        f"{{\n"
+        f'  \"tool\": \"<your tool, e.g. cursor | aider | gemini-cli>\",\n'
+        f'  \"tool_version\": \"<optional, e.g. 0.42.3>\",\n'
+        f'  \"ai_model\": \"<your model, e.g. gpt-5 | gemini-2.5-pro>\"\n'
+        f"}}\n\n"
+        f"Then run: {full_cmd}\n"
+        f"{rule}\n\n"
+        f"Alternatives (no file needed):\n"
+        f"  * One-off:  {full_cmd} --tool <name> --ai-model <name>\n"
+        f"  * Persist:  aicodinggym set-attribution --tool <name> --model <name>"
+    )
+
+
+@main.command("set-attribution")
+@click.option(
+    "--tool", default=None,
+    help="Coding tool name (e.g. claude-code, cursor, aider, codex-cli).",
+)
+@click.option(
+    "--tool-version", default=None,
+    help="Optional version string for the tool.",
+)
+@click.option(
+    "--model", "ai_model", default=None,
+    help="AI model identifier (e.g. claude-opus-4-7, gpt-5, gemini-2.5-pro).",
+)
+def set_attribution(tool: str | None, tool_version: str | None, ai_model: str | None):
+    """Persist tool/model attribution used as the reliable fallback when
+    auto-detection cannot identify the current session.
+
+    Every subsequent submission picks up these values automatically unless
+    overridden by per-command flags (``--tool``, ``--tool-version``,
+    ``--ai-model``) or live auto-detection.
+
+    \b
+    EXAMPLE:
+      aicodinggym set-attribution --tool claude-code --model claude-opus-4-7
+      aicodinggym set-attribution --tool cursor --model claude-sonnet-4-5
+    """
+    if not any([tool, tool_version, ai_model]):
+        _error(
+            "Provide at least one of --tool, --tool-version, --model.\n\n"
+            "Example:\n"
+            "  aicodinggym set-attribution --tool claude-code --model claude-opus-4-7"
+        )
+
+    current = load_attribution()
+    if tool is not None:
+        current["tool"] = tool
+    if tool_version is not None:
+        current["tool_version"] = tool_version
+    if ai_model is not None:
+        current["ai_model"] = ai_model
+    save_attribution(current)
+
+    click.echo(
+        f"Saved attribution to {ATTRIBUTION_PATH}:\n"
+        f"  tool:          {current.get('tool') or '(unset)'}\n"
+        f"  tool_version:  {current.get('tool_version') or '(unset)'}\n"
+        f"  ai_model:      {current.get('ai_model') or '(unset)'}"
+    )
+
+
+@main.command("show-attribution")
+def show_attribution():
+    """Print the persisted attribution and the live auto-detected values."""
+    persisted = load_attribution()
+    resolved = resolve_env(None, None, None)
+    click.echo("Persisted attribution (~/.aicodinggym/attribution.json):")
+    click.echo(f"  tool:          {persisted.get('tool') or '(unset)'}")
+    click.echo(f"  tool_version:  {persisted.get('tool_version') or '(unset)'}")
+    click.echo(f"  ai_model:      {persisted.get('ai_model') or '(unset)'}")
+    click.echo("")
+    click.echo("Effective values for the next submission (auto-detect ∪ persisted):")
+    click.echo(f"  tool:          {resolved.get('tool') or '(none)'}")
+    click.echo(f"  tool_version:  {resolved.get('tool_version') or '(none)'}")
+    click.echo(f"  ai_model:      {resolved.get('ai_model') or '(none)'}")
+
+
+@main.command("clear-attribution")
+def clear_attribution_cmd():
+    """Remove the persisted attribution file."""
+    if clear_attribution():
+        click.echo(f"Removed {ATTRIBUTION_PATH}.")
+    else:
+        click.echo("No persisted attribution to remove.")
+
+
 # ── swe group ────────────────────────────────────────────────────────────────
 
 
@@ -772,13 +894,16 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
     branch = creds["branch"]
     commit_msg = message or f"Solution submission for {problem_id} at {datetime.now().isoformat()}"
 
+    # Resolve + enforce attribution BEFORE pushing, so a rejection leaves no
+    # side effects (nothing committed/pushed, backend not notified).
+    env = resolve_env(tool, tool_version, ai_model, problem_dir=problem_dir)
+    _require_attribution(env, "swe submit", problem_id)
+
     click.echo(f"Submitting solution for '{problem_id}'...")
     success, msg, commit_hash = add_commit_push(str(problem_dir), branch, key_path, commit_msg, force)
 
     if not success:
         _error(msg)
-
-    env = resolve_env(tool, tool_version, ai_model)
 
     # Notify backend
     try:
@@ -1291,7 +1416,9 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
             f"  aicodinggym cr submit {problem_id} -f review.md"
         )
 
-    env = resolve_env(tool, tool_version, ai_model)
+    cr_problem_dir = _resolve_workspace(config, None) / problem_id
+    env = resolve_env(tool, tool_version, ai_model, problem_dir=cr_problem_dir)
+    _require_attribution(env, "cr submit", problem_id)
     try:
         result = cr_submit_review(uid, problem_id, review.strip(), **env)
     except APIError as e:
@@ -1445,7 +1572,8 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
 
     # solution_log.json (per CLAUDE.md) is the most accurate model record for MLE
     log_model = read_solution_log_model(csv_src.parent)
-    env = resolve_env(tool, tool_version, ai_model or log_model)
+    env = resolve_env(tool, tool_version, ai_model or log_model, problem_dir=csv_src.parent)
+    _require_attribution(env, "mle submit", competition_id)
 
     click.echo(f"Uploading {csv_src.name} for '{competition_id}'...")
 
@@ -1457,9 +1585,27 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     score_msg = result.get("message", "Submission received for scoring.")
     score = result.get("score")
     percentile = result.get("leaderboard_percentile")
+    grade_status = result.get("status") or ("graded" if score is not None else "invalid")
+    grade_error = result.get("error")
 
-    # Forward percentile + attribution to the Prisma backend so the leaderboard
-    # aggregator can rank tools/models. Fire-and-forget — never fail the submit.
+    # Persist one Submission row per MLE upload (mirrors SWE/CR) so per-attempt
+    # history with tool/model attribution lands in Prisma even when grading
+    # fails. Fire-and-forget — never fail the submit if the call errors.
+    try:
+        record_mle_submission(
+            user_id=uid,
+            competition_id=competition_id,
+            score=score,
+            percentile=percentile,
+            status=grade_status,
+            csv_name=csv_src.name,
+            error=grade_error,
+            **env,
+        )
+    except APIError as e:
+        _warn(f"Submitted, but failed to record submission row: {e}")
+
+    # Also update UserProgress (best-percentile leaderboard view).
     if percentile is not None:
         try:
             notify_mle_progress(uid, competition_id, float(percentile), **env)

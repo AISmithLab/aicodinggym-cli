@@ -183,6 +183,31 @@ def mlebench_download_file(url: str, dest_path: str, timeout: int = 300) -> None
         raise APIError(f"Download failed: {e}")
 
 
+def record_mle_submission(user_id: str, competition_id: str,
+                          score: float | None,
+                          percentile: float | None,
+                          status: str,
+                          csv_name: str | None = None,
+                          error: str | None = None,
+                          tool: str | None = None,
+                          tool_version: str | None = None,
+                          ai_model: str | None = None) -> dict:
+    """Persist an MLE-bench grading result as a Prisma Submission row so the
+    main DB has per-attempt history with tool/model attribution."""
+    return _post("mle-submission", {
+        "user_id": user_id,
+        "competition_id": competition_id,
+        "score": score,
+        "percentile": percentile,
+        "status": status,
+        "csv_name": csv_name,
+        "error": error,
+        "tool": tool,
+        "tool_version": tool_version,
+        "ai_model": ai_model,
+    })
+
+
 def mlebench_submit_csv(user_id: str, competition_id: str, csv_path: str,
                         tool: str | None = None,
                         tool_version: str | None = None,
