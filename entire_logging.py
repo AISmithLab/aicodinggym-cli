@@ -101,12 +101,10 @@ def install() -> tuple[bool, str]:
             # Scoop lives behind PowerShell; auto-driving it reliably is brittle,
             # so we defer to the documented manual command.
             return False, "automatic install is not supported on Windows"
-        res = subprocess.run(
-            ["bash", "-c", INSTALL_COMMAND],
-            capture_output=True, text=True, timeout=300,
-        )
+        # Stream the installer's output so the download doesn't look frozen.
+        res = subprocess.run(["bash", "-c", INSTALL_COMMAND], timeout=300)
         if res.returncode != 0:
-            return False, (res.stderr or res.stdout or "installer exited non-zero").strip()
+            return False, "installer exited non-zero (see output above)"
         # shutil.which caches nothing, but the new binary may have landed in a
         # dir not yet on this process's PATH (e.g. ~/.local/bin).
         if is_available():

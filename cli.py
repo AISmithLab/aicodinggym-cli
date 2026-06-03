@@ -43,7 +43,7 @@ from .api import (
     fetch_pr as api_fetch_pr,
     fetch_problem as api_fetch_problem,
     mlebench_download_file,
-    mlebench_download_info,
+    mlebench_download_open,
     mlebench_submit_csv,
     submit_notification,
 )
@@ -548,6 +548,7 @@ def _configure_logging(upload_logs_flag: bool | None) -> None:
         click.echo(f"  Install later with:\n    {entire_logging.INSTALL_COMMAND}")
         return
     if click.confirm("Install the Entire CLI now?", default=True):
+        click.echo("Installing Entire (downloading a binary; this may take a minute)...")
         ok, msg = entire_logging.install()
         if ok:
             click.echo(f"  Entire: {msg}")
@@ -1503,7 +1504,22 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
 
     try:
         click.echo(f"Downloading dataset for '{competition_id}'...")
-        mlebench_download_info(uid, competition_id, str(dest_path))
+        total, chunks = mlebench_download_open(competition_id)
+        with open(dest_path, "wb") as f:
+            if total:
+                with click.progressbar(length=total, label="  Downloading",
+                                       show_percent=True) as bar:
+                    for chunk in chunks:
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            else:
+                # Server didn't advertise a size — show a running byte counter.
+                downloaded = 0
+                for chunk in chunks:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    click.echo(f"\r  {downloaded / 1_048_576:.1f} MB downloaded", nl=False)
+                click.echo()
     except APIError as e:
         _error(str(e))
 
