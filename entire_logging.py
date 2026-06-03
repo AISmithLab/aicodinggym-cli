@@ -24,9 +24,11 @@ redacts detected secrets when writing to the checkpoints branch (best-effort).
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -217,16 +219,18 @@ def commit_workspace(repo_dir: Path, message: str) -> bool:
 
 def push_branch(repo_dir: Path, *, remote_url: str, dest_branch: str,
                 key_path: Path | None = None) -> tuple[bool, str]:
-    """Push the current HEAD to ``dest_branch`` on ``remote_url`` (force).
+    """Push the current HEAD to a fresh ``dest_branch`` on ``remote_url``.
 
-    Used for MLE: pushes the user's solution code to a competition-named branch
-    in their own repo. Returns (ok, branch_or_error). Never raises.
+    Used for MLE to push the user's solution code. The caller passes a unique,
+    per-submission branch name (see :func:`new_stamp`), so we do NOT force-push:
+    each submission lands on its own branch and previous ones are preserved.
+    Returns (ok, branch_or_error). Never raises.
     """
     try:
-        safe = dest_branch.replace(" ", "_")
+        safe = _safe_ref(dest_branch)
         refspec = f"HEAD:refs/heads/{safe}"
         res = git_ops.run_git_command(
-            ["git", "push", "--force", remote_url, refspec], str(repo_dir), key_path,
+            ["git", "push", remote_url, refspec], str(repo_dir), key_path,
         )
         if res.returncode != 0:
             return False, (res.stderr or "git push failed").strip()
@@ -235,21 +239,40 @@ def push_branch(repo_dir: Path, *, remote_url: str, dest_branch: str,
         return False, str(e)
 
 
-def logs_branch(benchmark: str, problem_id: str) -> str:
-    """Remote branch name that identifies which problem a log belongs to."""
-    safe = problem_id.replace(" ", "_")
-    return f"aicodinggym-logs/{benchmark}/{safe}"
+def new_stamp() -> str:
+    """A unique, sortable per-submission id: ``<UTC-timestamp>-<random>``.
+
+    Used to give every upload its own branch so re-submissions — and submissions
+    of the same problem from different directories/machines — never overwrite
+    each other's logs.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+
+
+def logs_branch(benchmark: str, problem_id: str, suffix: str | None = None) -> str:
+    """Remote branch identifying which problem (and submission) a log belongs to.
+
+    ``aicodinggym-logs/<benchmark>/<problem_id>`` — and when ``suffix`` is given
+    (the per-submission stamp), ``.../<problem_id>/<suffix>`` so each upload is a
+    distinct, non-overwriting branch.
+    """
+    parts = ["aicodinggym-logs", benchmark, _safe_ref(problem_id)]
+    if suffix:
+        parts.append(_safe_ref(suffix))
+    return "/".join(parts)
 
 
 def upload(repo_dir: Path, *, remote_url: str, benchmark: str, problem_id: str,
            user_id: str, key_path: Path | None = None, tool: str | None = None,
-           cli_version: str | None = None) -> tuple[bool, str]:
+           cli_version: str | None = None,
+           submission_stamp: str | None = None) -> tuple[bool, str]:
     """Push the captured session branch to ``remote_url`` for research.
 
-    Pushes ``entire/checkpoints/v1`` to a per-problem branch
-    (:func:`logs_branch`) on the given writable remote, after injecting an
+    Pushes ``entire/checkpoints/v1`` to a unique per-submission branch
+    (:func:`logs_branch` with a stamp), after injecting an
     ``aicodinggym-meta.json`` metadata file at the tip so each upload is
-    self-describing. Returns (ok, branch_or_error). Never raises.
+    self-describing. The unique branch means previous logs are never
+    overwritten. Returns (ok, branch_or_error). Never raises.
     """
     repo_dir = Path(repo_dir)
     try:
@@ -258,12 +281,14 @@ def upload(repo_dir: Path, *, remote_url: str, benchmark: str, problem_id: str,
             return False, "no captured sessions to upload"
         parent = tip.stdout.strip()
 
+        stamp = submission_stamp or new_stamp()
         meta = {
             "problem_id": problem_id,
             "benchmark": benchmark,
             "user_id": user_id,
             "tool": tool,
             "cli_version": cli_version,
+            "submission_id": stamp,
             "captured_by": "aicodinggym-cli",
             "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -272,12 +297,11 @@ def upload(repo_dir: Path, *, remote_url: str, benchmark: str, problem_id: str,
         # the raw tip if plumbing fails — the branch name still identifies it.
         push_sha = _commit_with_metadata(repo_dir, parent, meta) or parent
 
-        dest = logs_branch(benchmark, problem_id)
+        dest = logs_branch(benchmark, problem_id, stamp)
         refspec = f"{push_sha}:refs/heads/{dest}"
-        # Force: re-submitting the same problem replaces its log branch. Entire's
-        # checkpoint branch accumulates history, so the latest tip is lossless.
+        # No force: a fresh per-submission branch, so nothing is overwritten.
         push = git_ops.run_git_command(
-            ["git", "push", "--force", remote_url, refspec], str(repo_dir), key_path,
+            ["git", "push", remote_url, refspec], str(repo_dir), key_path,
         )
         if push.returncode != 0:
             return False, (push.stderr or "git push failed").strip()
@@ -287,6 +311,13 @@ def upload(repo_dir: Path, *, remote_url: str, benchmark: str, problem_id: str,
 
 
 # ── internals ────────────────────────────────────────────────────────────────
+
+
+def _safe_ref(name: str) -> str:
+    """Sanitise a string into a valid git ref path component."""
+    safe = re.sub(r"[ \t~^:?*\[\]\\\x00-\x1f\x7f]", "_", name)
+    safe = safe.replace("..", "_").strip("/")
+    return safe or "_"
 
 
 def _entire(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -319,11 +350,27 @@ def ensure_git_repo(repo_dir: Path) -> tuple[bool, str]:
     if init.returncode != 0:
         return False, (init.stderr or "git init failed").strip()
 
-    # Keep heavy/derived files out of the repo; we never commit the working
-    # tree anyway, but this keeps Entire's "files touched" view sane.
+    # Keep heavy/derived ML artifacts out of the repo so the code branch we push
+    # on submit stays small. The dataset and common model/checkpoint/cache files
+    # are excluded; the user's notebooks/scripts and submission CSV are kept.
     gitignore = repo_dir / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    wanted = ["data/", "*.zip", ".entire/"]
+    wanted = [
+        # dataset & archives
+        "data/", "*.zip", "*.tar", "*.tar.gz", "*.tgz", "*.7z",
+        # python / tooling caches
+        "__pycache__/", "*.py[cod]", ".ipynb_checkpoints/",
+        ".venv/", "venv/", "env/", ".env",
+        ".entire/",
+        # model weights / serialized artifacts
+        "*.pkl", "*.pickle", "*.joblib", "*.npy", "*.npz",
+        "*.h5", "*.hdf5", "*.pt", "*.pth", "*.ckpt", "*.onnx", "*.pb", "*.bin", "*.safetensors",
+        # experiment-tracking / output dirs
+        "wandb/", "mlruns/", "lightning_logs/", "runs/",
+        "checkpoints/", "outputs/", "artifacts/", "models/",
+        # logs
+        "*.log",
+    ]
     missing = [w for w in wanted if w not in existing.splitlines()]
     if missing:
         block = ("" if existing.endswith("\n") or not existing else "\n") + \

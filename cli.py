@@ -415,77 +415,85 @@ def _maybe_upload_logs(problem_dir: Path, *, benchmark: str, problem_id: str,
                        user_id: str, key_path: Path | None, config: dict,
                        creds: dict | None, upload_flag: bool | None,
                        logs_remote_override: str | None, tool: str | None = None,
-                       flush: bool = False) -> None:
-    """Consent-gated upload of the captured AI session at submit time."""
+                       flush: bool = False) -> str:
+    """Consent-gated upload of the captured AI session at submit time.
+
+    Returns a status line (or "") to embed in the caller's success summary. Any
+    interactive consent prompt happens here, so callers should invoke this
+    *before* printing their banner. Hard failures are warned to stderr.
+    """
     if not entire_logging.is_available():
         if get_logging_consent() is not False:  # not explicitly opted out
-            click.echo(
+            return (
                 "  Logs:    Not captured — the 'entire' CLI isn't installed.\n"
-                f"           Run '{_configure_hint(user_id)}' to enable logging for next time."
+                f"           Run '{_configure_hint(user_id)}' to enable logging next time."
             )
-        return
+        return ""
     if not entire_logging.is_enabled(problem_dir):
-        return  # repo wasn't set up for capture (e.g. fetched before install)
+        return ""  # repo wasn't set up for capture (e.g. fetched before install)
     if flush:
         entire_logging.flush(problem_dir)
     if not entire_logging.has_sessions(problem_dir):
-        return  # nothing was captured — stay quiet
+        return ""  # nothing was captured — stay quiet
 
     if not _resolve_log_upload_consent(upload_flag):
-        click.echo("  Logs:    AI session captured locally; upload skipped.")
-        return
+        return "  Logs:    AI session captured locally; upload skipped."
 
     remote = _resolve_logs_remote(benchmark, creds, config, logs_remote_override)
     if not remote:
-        click.echo(
+        return (
             "  Logs:    consented, but no logs repository is configured.\n"
             "           Re-run 'aicodinggym configure' or pass --logs-remote URL."
         )
-        return
 
     ok, info = entire_logging.upload(
         problem_dir, remote_url=remote, benchmark=benchmark, problem_id=problem_id,
         user_id=user_id, key_path=key_path, tool=tool, cli_version=__version__,
     )
     if ok:
-        click.echo(f"  Logs:    uploaded for research (branch {info})")
-    else:
-        _warn(f"AI session log upload failed: {info}")
+        return f"  Logs:    uploaded for research (branch {info})"
+    _warn(f"AI session log upload failed: {info}")
+    return ""
 
 
 def _maybe_submit_mle_artifacts(workspace_repo: Path, *, competition_id: str,
                                 user_id: str, config: dict, key_path: Path | None,
                                 upload_flag: bool | None,
-                                logs_remote_override: str | None) -> None:
-    """MLE submit: push the solution code to a <competition_id> branch and (when
-    captured) the AI session logs — both to the user's own repo, gated by the
-    single log-upload consent. The CSV itself already went to the API.
+                                logs_remote_override: str | None) -> str:
+    """MLE submit: push the solution code and (when captured) the AI session logs
+    to the user's own repo, gated by the single log-upload consent. Each goes to
+    a unique per-submission branch so prior submissions are never overwritten.
+    The CSV itself already went to the API. Returns a status block (or "").
     """
     workspace_repo = Path(workspace_repo)
     if not (workspace_repo / ".git").exists():
-        return  # workspace was never initialised (e.g. downloaded pre-upgrade)
+        return ""  # workspace was never initialised (e.g. downloaded pre-upgrade)
 
     # Commit the solution code locally. With Entire enabled this commit also
     # materialises the AI session checkpoint, so no separate flush is needed.
     entire_logging.commit_workspace(workspace_repo, f"MLE submission: {competition_id}")
 
     if not _resolve_log_upload_consent(upload_flag):
-        click.echo("  Logs:    code + AI session captured locally; upload skipped.")
-        return
+        return "  Logs:    code + AI session captured locally; upload skipped."
 
     remote = _resolve_logs_remote("mle", None, config, logs_remote_override)
     if not remote:
-        click.echo(
+        return (
             "  Logs:    consented, but no repository is configured to push to.\n"
             "           Re-run 'aicodinggym configure' or pass --logs-remote URL."
         )
-        return
+
+    # One stamp ties this submission's code branch and log branch together, and
+    # makes both unique so re-submissions never overwrite earlier ones.
+    stamp = entire_logging.new_stamp()
+    lines: list[str] = []
 
     code_ok, code_info = entire_logging.push_branch(
-        workspace_repo, remote_url=remote, dest_branch=competition_id, key_path=key_path,
+        workspace_repo, remote_url=remote,
+        dest_branch=f"{competition_id}/{stamp}", key_path=key_path,
     )
     if code_ok:
-        click.echo(f"  Code:    pushed to branch '{code_info}'")
+        lines.append(f"  Code:    pushed to branch '{code_info}'")
     else:
         _warn(f"MLE code push failed: {code_info}")
 
@@ -493,16 +501,17 @@ def _maybe_submit_mle_artifacts(workspace_repo: Path, *, competition_id: str,
         ok, info = entire_logging.upload(
             workspace_repo, remote_url=remote, benchmark="mle", problem_id=competition_id,
             user_id=user_id, key_path=key_path, cli_version=__version__,
+            submission_stamp=stamp,
         )
         if ok:
-            click.echo(f"  Logs:    uploaded for research (branch {info})")
+            lines.append(f"  Logs:    uploaded for research (branch {info})")
         else:
             _warn(f"AI session log upload failed: {info}")
     elif not entire_logging.is_available():
-        click.echo(
-            f"  Logs:    AI session not captured ('entire' not installed).\n"
-            f"           Run '{_configure_hint(user_id)}' to enable logging next time."
-        )
+        lines.append("  Logs:    AI session not captured ('entire' not installed).")
+        lines.append(f"           Run '{_configure_hint(user_id)}' to enable logging next time.")
+
+    return "\n".join(lines)
 
 
 def _configure_logging(upload_logs_flag: bool | None) -> None:
@@ -901,23 +910,26 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
     except APIError as e:
         _warn(f"Changes pushed, but failed to notify backend: {e}")
 
-    click.echo(
-        f"\nSuccessfully submitted solution for {problem_id}\n"
-        f"\n"
-        f"  Commit:  {commit_hash[:8]}\n"
-        f"  Branch:  {branch}\n"
-        f"  Status:  Pushed and backend notified\n"
-        f"\n"
-        f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/swe/{problem_id}')}"
-    )
-
-    # The solution commit above already triggered Entire's checkpoint, so no
-    # flush is needed here — just upload (with consent).
-    _maybe_upload_logs(
+    # Resolve logging (incl. any consent prompt) before the summary so the
+    # prompt never interrupts the success banner. The solution commit above
+    # already triggered Entire's checkpoint, so no flush is needed.
+    log_status = _maybe_upload_logs(
         problem_dir, benchmark="swe", problem_id=problem_id, user_id=uid,
         key_path=key_path, config=config, creds=creds, upload_flag=upload_logs,
         logs_remote_override=logs_remote,
     )
+
+    summary = [
+        f"\nSuccessfully submitted solution for {problem_id}\n",
+        f"  Commit:  {commit_hash[:8]}",
+        f"  Branch:  {branch}",
+        f"  Status:  Pushed and backend notified",
+    ]
+    if log_status:
+        summary.append(log_status)
+    summary.append("")
+    summary.append(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/swe/{problem_id}')}")
+    click.echo("\n".join(summary))
 
 
 @swe.command("reset")
@@ -1401,25 +1413,29 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
     except APIError as e:
         _error(str(e))
 
-    click.echo(
-        f"\nSuccessfully submitted code review for {problem_id}\n"
-        f"\n"
-        f"  Status:  {result.get('status', 'COMPLETED')}\n"
-        f"\n"
-        f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/cr/{problem_id}')}"
-    )
-
     # CR clones a read-only PR, so logs upload to the user's own submission repo.
     # The CR flow makes no commit, so flush=True materialises the checkpoint.
+    # Resolve before the banner so any consent prompt comes first.
     creds = load_credentials().get(problem_id)
     workspace = _resolve_workspace(config, workspace_dir or (creds or {}).get("workspace_dir"))
     problem_dir = workspace / problem_id
+    log_status = ""
     if problem_dir.exists():
-        _maybe_upload_logs(
+        log_status = _maybe_upload_logs(
             problem_dir, benchmark="cr", problem_id=problem_id, user_id=uid,
             key_path=_safe_key_path(config, creds), config=config, creds=creds,
             upload_flag=upload_logs, logs_remote_override=logs_remote, flush=True,
         )
+
+    summary = [
+        f"\nSuccessfully submitted code review for {problem_id}\n",
+        f"  Status:  {result.get('status', 'COMPLETED')}",
+    ]
+    if log_status:
+        summary.append(log_status)
+    summary.append("")
+    summary.append(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/cr/{problem_id}')}")
+    click.echo("\n".join(summary))
 
 
 # ── mle group ────────────────────────────────────────────────────────────────
@@ -1562,23 +1578,28 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     score_msg = result.get("message", "Submission received for scoring.")
     score = result.get("score")
 
-    click.echo(
-        f"\nSuccessfully submitted prediction for {competition_id}\n"
-        f"\n"
-        f"  CSV:     {csv_src.name}\n"
-        f"  Status:  {score_msg}\n"
-    )
-    if score is not None:
-        click.echo(f"  Score:   {score}\n")
-    click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
-
-    # Push the user's solution code to a <competition_id> branch and (with
-    # consent) the AI session logs, both to the user's own repo.
+    # Push the user's solution code + (with consent) the AI session logs to the
+    # user's own repo, each on a unique per-submission branch. Resolve before
+    # the banner so any consent prompt comes first.
     workspace = _resolve_workspace(config, workspace_dir)
     competition_dir = workspace / competition_id
+    artifacts_status = ""
     if competition_dir.exists():
-        _maybe_submit_mle_artifacts(
+        artifacts_status = _maybe_submit_mle_artifacts(
             competition_dir, competition_id=competition_id, user_id=uid, config=config,
             key_path=_safe_key_path(config), upload_flag=upload_logs,
             logs_remote_override=logs_remote,
         )
+
+    summary = [
+        f"\nSuccessfully submitted prediction for {competition_id}\n",
+        f"  CSV:     {csv_src.name}",
+        f"  Status:  {score_msg}",
+    ]
+    if score is not None:
+        summary.append(f"  Score:   {score}")
+    if artifacts_status:
+        summary.append(artifacts_status)
+    summary.append("")
+    summary.append(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
+    click.echo("\n".join(summary))

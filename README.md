@@ -207,22 +207,29 @@ that repo URL (`submission_repo_url`) so CR/MLE reuse it; the cloned CR PR repo
 is read-only and is never used as a target. Override with `--logs-remote` or the
 `AICODINGGYM_LOGS_REMOTE` env var.
 
+**Nothing is overwritten.** Every submission gets its own unique branch
+(`…/<submission-id>`, a UTC timestamp + random suffix). Re-submitting the same
+problem — or submitting it from a different directory or machine — adds a new
+branch and never deletes or clobbers a previous one.
+
 **How it works**
 
 1. `swe fetch` / `cr fetch` / `mle download` installs Entire's hooks so your
    session is captured locally as you work. (MLE workspaces aren't git repos, so
    a lightweight one is initialised — this also lets your solution code be
-   pushed on submit. The dataset under `data/` is gitignored.)
+   pushed on submit. The dataset under `data/` plus common model/checkpoint/cache
+   artifacts are gitignored.)
    If the `entire` CLI isn't installed, you're pointed at `aicodinggym configure`
    (which offers to install it) instead of being silently skipped.
 2. On `submit`, after consent, the captured `entire/checkpoints/v1` branch is
-   pushed to your repo on a per-problem branch
-   `aicodinggym-logs/<benchmark>/<problem_id>`, with an `aicodinggym-meta.json`
-   file at the tip (problem id, benchmark, user, tool, timestamp).
-3. **MLE also pushes your solution code** (notebooks/scripts/CSV; `data/`
-   excluded) to a branch named after the competition (e.g. `spaceship-titanic`),
-   gated by the same consent. The prediction CSV still goes to the scoring API as
-   before.
+   pushed to your repo on a unique per-submission branch
+   `aicodinggym-logs/<benchmark>/<problem_id>/<submission-id>`, with an
+   `aicodinggym-meta.json` file at the tip (problem id, benchmark, user, tool,
+   submission id, timestamp).
+3. **MLE also pushes your solution code** (notebooks/scripts/CSV; dataset and
+   heavy artifacts excluded) to `<competition_id>/<submission-id>`, gated by the
+   same consent. The two share a submission id so code and logs correlate. The
+   prediction CSV still goes to the scoring API as before.
 
 **Privacy.** Uploaded data is used solely for research and is
 de-identified/anonymized before use. Entire also redacts detected secrets when
@@ -241,7 +248,15 @@ aicodinggym-cli/
 ├── api.py           # HTTP client for aicodinggym.com/api
 ├── git_ops.py       # SSH key generation, git clone/commit/push/reset
 ├── entire_logging.py # Optional AI-session capture/upload via the Entire CLI
+├── tests/           # pytest suite (logging, consent, remote resolution)
 └── pyproject.toml   # Package metadata and build config
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"   # installs pytest
+pytest                    # run the test suite
 ```
 
 ## Configuration Files
