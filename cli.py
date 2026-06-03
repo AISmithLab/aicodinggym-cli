@@ -411,6 +411,19 @@ def _resolve_logs_remote(benchmark: str, creds: dict | None,
     return None
 
 
+def _logging_status(thunk) -> str:
+    """Run a logging step before the success banner, never suppressing it.
+
+    The submission already succeeded by the time logging runs, so any unexpected
+    error here must not hide the banner — degrade to a warning + empty status.
+    """
+    try:
+        return thunk()
+    except Exception as e:  # noqa: BLE001
+        _warn(f"AI session logging skipped due to an error: {e}")
+        return ""
+
+
 def _maybe_upload_logs(problem_dir: Path, *, benchmark: str, problem_id: str,
                        user_id: str, key_path: Path | None, config: dict,
                        creds: dict | None, upload_flag: bool | None,
@@ -913,11 +926,11 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
     # Resolve logging (incl. any consent prompt) before the summary so the
     # prompt never interrupts the success banner. The solution commit above
     # already triggered Entire's checkpoint, so no flush is needed.
-    log_status = _maybe_upload_logs(
+    log_status = _logging_status(lambda: _maybe_upload_logs(
         problem_dir, benchmark="swe", problem_id=problem_id, user_id=uid,
         key_path=key_path, config=config, creds=creds, upload_flag=upload_logs,
         logs_remote_override=logs_remote,
-    )
+    ))
 
     summary = [
         f"\nSuccessfully submitted solution for {problem_id}\n",
@@ -1421,11 +1434,11 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
     problem_dir = workspace / problem_id
     log_status = ""
     if problem_dir.exists():
-        log_status = _maybe_upload_logs(
+        log_status = _logging_status(lambda: _maybe_upload_logs(
             problem_dir, benchmark="cr", problem_id=problem_id, user_id=uid,
             key_path=_safe_key_path(config, creds), config=config, creds=creds,
             upload_flag=upload_logs, logs_remote_override=logs_remote, flush=True,
-        )
+        ))
 
     summary = [
         f"\nSuccessfully submitted code review for {problem_id}\n",
@@ -1585,11 +1598,11 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     competition_dir = workspace / competition_id
     artifacts_status = ""
     if competition_dir.exists():
-        artifacts_status = _maybe_submit_mle_artifacts(
+        artifacts_status = _logging_status(lambda: _maybe_submit_mle_artifacts(
             competition_dir, competition_id=competition_id, user_id=uid, config=config,
             key_path=_safe_key_path(config), upload_flag=upload_logs,
             logs_remote_override=logs_remote,
-        )
+        ))
 
     summary = [
         f"\nSuccessfully submitted prediction for {competition_id}\n",

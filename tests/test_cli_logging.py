@@ -5,6 +5,12 @@ import pytest
 from aicodinggym import cli
 
 
+@pytest.fixture(autouse=True)
+def _clear_logs_remote_env(monkeypatch):
+    """Resolution reads AICODINGGYM_LOGS_REMOTE first; keep tests hermetic."""
+    monkeypatch.delenv("AICODINGGYM_LOGS_REMOTE", raising=False)
+
+
 # ── _resolve_logs_remote: one repo for all, SWE-only clone fallback ──────────
 
 def test_swe_falls_back_to_problem_repo_when_no_submission_repo():
@@ -84,3 +90,15 @@ def test_interactive_prompt_is_recorded(_isolate_consent, monkeypatch):
 def test_configure_hint_includes_user_id():
     assert cli._configure_hint("alice") == "aicodinggym configure --user-id alice"
     assert cli._configure_hint(None) == "aicodinggym configure"
+
+
+# ── _logging_status: must never let logging suppress the success banner ──────
+
+def test_logging_status_swallows_errors():
+    def boom():
+        raise RuntimeError("kaboom")
+    assert cli._logging_status(boom) == ""
+
+
+def test_logging_status_passes_value_through():
+    assert cli._logging_status(lambda: "  Logs:    uploaded") == "  Logs:    uploaded"
