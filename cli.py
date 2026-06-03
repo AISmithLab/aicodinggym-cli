@@ -332,13 +332,13 @@ def _configure_hint(user_id: str | None) -> str:
 
 
 def _setup_logging(problem_dir: Path, *, init_git: bool = False,
-                   user_id: str | None = None) -> None:
+                   user_id: str | None = None) -> bool:
     """Best-effort: install Entire hooks so the session is captured locally.
 
     Capture is local-only; nothing is uploaded until the user consents at
     submit. If Entire isn't installed, point the user at ``configure`` (which
     offers to install it) rather than silently skipping — unless they've already
-    opted out of logging.
+    opted out of logging. Returns True if AI-session capture is now active.
     """
     if not entire_logging.is_available():
         if get_logging_consent() is not False:  # not explicitly opted out
@@ -346,11 +346,28 @@ def _setup_logging(problem_dir: Path, *, init_git: bool = False,
                 "  Logging:     Not set up — the 'entire' CLI isn't installed.\n"
                 f"               Run '{_configure_hint(user_id)}' to enable AI workflow logging."
             )
-        return
+        return False
     ok, msg = entire_logging.setup(problem_dir, init_git=init_git)
     if ok:
         click.echo(f"  Logging:     {msg} (uploaded only with your consent on submit)")
+        return True
     # On setup failure (Entire present but enable errored) we stay quiet.
+    return False
+
+
+def _launch_instruction(problem_dir: Path) -> str:
+    """Reminder that AI-session capture only works for an agent launched here.
+
+    Claude Code (and Codex etc.) load their capture hooks from the directory
+    they're started in, fixed for the whole session — cd-ing in later does not
+    activate them. So the agent must be launched inside the problem folder.
+    """
+    return (
+        f"Please start your agent inside {problem_dir}:\n"
+        f"  cd {problem_dir}\n"
+        "  claude                # or codex / your AI agent\n"
+        "(Capture only works for an agent launched here — not one you cd into later.)"
+    )
 
 
 def _safe_key_path(config: dict, creds: dict | None = None) -> Path | None:
@@ -664,7 +681,14 @@ def configure(user_id: str, workspace_dir: str | None, upload_logs: bool | None)
             else:
                 raise
 
-        resolved_workspace = str(Path(workspace_dir).resolve()) if workspace_dir else str(Path.cwd().resolve())
+        # Only change the workspace when --workspace-dir is explicitly given.
+        # On re-configure, preserve the previously configured workspace instead
+        # of silently relocating it to wherever 'configure' happened to run;
+        # fall back to the current directory only on first-time setup.
+        if workspace_dir:
+            resolved_workspace = str(Path(workspace_dir).resolve())
+        else:
+            resolved_workspace = existing.get("workspace_dir") or str(Path.cwd().resolve())
 
         config = {
             "user_id": user_id,
@@ -804,7 +828,7 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         save_config(config)
 
     _install_gym_environment(workspace / problem_id)
-    _setup_logging(workspace / problem_id, user_id=uid)
+    capture_active = _setup_logging(workspace / problem_id, user_id=uid)
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -814,6 +838,8 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if server_msg:
         click.echo(f"  Server: {server_msg}\n")
     click.echo("You can now start working on the solution!")
+    if capture_active:
+        click.echo("\n" + _launch_instruction(workspace / problem_id))
 
 
 @swe.command("submit")
@@ -1318,7 +1344,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     _install_gym_environment(workspace / problem_id)
-    _setup_logging(workspace / problem_id, user_id=uid)
+    capture_active = _setup_logging(workspace / problem_id, user_id=uid)
 
     problem_dir = workspace / problem_id
 
@@ -1356,6 +1382,8 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         f"  2. Write your review in {review_path}\n"
         f"  3. Submit:  aicodinggym cr submit {problem_id} -f review.md\n"
     )
+    if capture_active:
+        click.echo("\n" + _launch_instruction(problem_dir))
 
 
 @cr.command("submit")
@@ -1527,13 +1555,15 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
     # MLE workspaces aren't git repos: init one so the solution code can be
     # pushed on submit and Entire can attach for session capture.
     entire_logging.ensure_git_repo(workspace / competition_id)
-    _setup_logging(workspace / competition_id, user_id=uid)
+    capture_active = _setup_logging(workspace / competition_id, user_id=uid)
 
     click.echo(
         f"\nDataset downloaded to: {dest_path}\n"
         f"\nNext step: train your model and submit predictions with:\n"
         f"  aicodinggym mle submit {competition_id} -F your_predictions.csv"
     )
+    if capture_active:
+        click.echo("\n" + _launch_instruction(workspace / competition_id))
 
 
 @mle.command("submit")
