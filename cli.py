@@ -35,6 +35,7 @@ from pathlib import Path
 import click
 
 from . import __version__
+from . import entire_logging
 from .api import (
     APIError,
     configure as api_configure,
@@ -47,10 +48,12 @@ from .api import (
     submit_notification,
 )
 from .config import (
+    get_logging_consent,
     load_config,
     load_credentials,
     save_config,
     save_credentials,
+    set_logging_consent,
 )
 from .git_ops import (
     add_commit_push,
@@ -314,6 +317,227 @@ def _resolve_key_path(config: dict, creds: dict | None = None) -> Path:
     return key_path
 
 
+# ── AI-session logging (Entire integration) ──────────────────────────────────
+
+_CONSENT_PROMPT = (
+    "AI Coding Gym can upload this AI coding session (prompts, responses, files "
+    "changed) for research only. Data is de-identified/anonymized before use.\n"
+    "Upload your session logs on submit?"
+)
+
+
+def _configure_hint(user_id: str | None) -> str:
+    """A copy-pasteable 'configure' command (where Entire install is offered)."""
+    return f"aicodinggym configure --user-id {user_id}" if user_id else "aicodinggym configure"
+
+
+def _setup_logging(problem_dir: Path, *, init_git: bool = False,
+                   user_id: str | None = None) -> None:
+    """Best-effort: install Entire hooks so the session is captured locally.
+
+    Capture is local-only; nothing is uploaded until the user consents at
+    submit. If Entire isn't installed, point the user at ``configure`` (which
+    offers to install it) rather than silently skipping — unless they've already
+    opted out of logging.
+    """
+    if not entire_logging.is_available():
+        if get_logging_consent() is not False:  # not explicitly opted out
+            click.echo(
+                "  Logging:     Not set up — the 'entire' CLI isn't installed.\n"
+                f"               Run '{_configure_hint(user_id)}' to enable AI workflow logging."
+            )
+        return
+    ok, msg = entire_logging.setup(problem_dir, init_git=init_git)
+    if ok:
+        click.echo(f"  Logging:     {msg} (uploaded only with your consent on submit)")
+    # On setup failure (Entire present but enable errored) we stay quiet.
+
+
+def _safe_key_path(config: dict, creds: dict | None = None) -> Path | None:
+    """Resolve the SSH key for a log push without exiting if it's missing.
+
+    Unlike :func:`_resolve_key_path`, this returns None instead of aborting, so
+    an optional log upload never kills a submit that already succeeded.
+    """
+    path_str = (creds or {}).get("private_key_path") or config.get("private_key_path")
+    if not path_str:
+        return None
+    key_path = Path(path_str)
+    return key_path if key_path.exists() else None
+
+
+def _resolve_log_upload_consent(flag: bool | None) -> bool:
+    """Resolve whether to upload session logs, prompting once if needed.
+
+    Precedence: explicit --upload-logs/--no-upload-logs flag > stored consent >
+    first-time prompt. In non-interactive sessions with no recorded choice we
+    default to NOT uploading (privacy-safe) and print how to opt in.
+    """
+    if flag is not None:
+        set_logging_consent(flag)
+        return flag
+    stored = get_logging_consent()
+    if stored is not None:
+        return stored
+    if not sys.stdin.isatty():
+        click.echo(
+            "AI session captured locally; upload skipped (no consent on record).\n"
+            "  Opt in for research (de-identified): aicodinggym configure --upload-logs"
+        )
+        return False
+    answer = click.confirm("\n" + _CONSENT_PROMPT, default=False)
+    set_logging_consent(answer)
+    return answer
+
+
+def _resolve_logs_remote(benchmark: str, creds: dict | None,
+                         config: dict, override: str | None) -> str | None:
+    """Resolve the writable git URL to push session logs to.
+
+    All benchmarks log to the user's single repo (one repo, many branches),
+    distinguished by the per-problem log branch name. SWE may fall back to its
+    own writable clone URL when the submission repo isn't recorded yet; CR's
+    cloned repo is the read-only PR and must never be used.
+    """
+    if override:
+        return override
+    env = os.environ.get("AICODINGGYM_LOGS_REMOTE")
+    if env:
+        return env
+    if config.get("submission_repo_url"):
+        return config["submission_repo_url"]
+    if benchmark == "swe":
+        return (creds or {}).get("repo_url")
+    return None
+
+
+def _maybe_upload_logs(problem_dir: Path, *, benchmark: str, problem_id: str,
+                       user_id: str, key_path: Path | None, config: dict,
+                       creds: dict | None, upload_flag: bool | None,
+                       logs_remote_override: str | None, tool: str | None = None,
+                       flush: bool = False) -> None:
+    """Consent-gated upload of the captured AI session at submit time."""
+    if not entire_logging.is_available():
+        if get_logging_consent() is not False:  # not explicitly opted out
+            click.echo(
+                "  Logs:    Not captured — the 'entire' CLI isn't installed.\n"
+                f"           Run '{_configure_hint(user_id)}' to enable logging for next time."
+            )
+        return
+    if not entire_logging.is_enabled(problem_dir):
+        return  # repo wasn't set up for capture (e.g. fetched before install)
+    if flush:
+        entire_logging.flush(problem_dir)
+    if not entire_logging.has_sessions(problem_dir):
+        return  # nothing was captured — stay quiet
+
+    if not _resolve_log_upload_consent(upload_flag):
+        click.echo("  Logs:    AI session captured locally; upload skipped.")
+        return
+
+    remote = _resolve_logs_remote(benchmark, creds, config, logs_remote_override)
+    if not remote:
+        click.echo(
+            "  Logs:    consented, but no logs repository is configured.\n"
+            "           Re-run 'aicodinggym configure' or pass --logs-remote URL."
+        )
+        return
+
+    ok, info = entire_logging.upload(
+        problem_dir, remote_url=remote, benchmark=benchmark, problem_id=problem_id,
+        user_id=user_id, key_path=key_path, tool=tool, cli_version=__version__,
+    )
+    if ok:
+        click.echo(f"  Logs:    uploaded for research (branch {info})")
+    else:
+        _warn(f"AI session log upload failed: {info}")
+
+
+def _maybe_submit_mle_artifacts(workspace_repo: Path, *, competition_id: str,
+                                user_id: str, config: dict, key_path: Path | None,
+                                upload_flag: bool | None,
+                                logs_remote_override: str | None) -> None:
+    """MLE submit: push the solution code to a <competition_id> branch and (when
+    captured) the AI session logs — both to the user's own repo, gated by the
+    single log-upload consent. The CSV itself already went to the API.
+    """
+    workspace_repo = Path(workspace_repo)
+    if not (workspace_repo / ".git").exists():
+        return  # workspace was never initialised (e.g. downloaded pre-upgrade)
+
+    # Commit the solution code locally. With Entire enabled this commit also
+    # materialises the AI session checkpoint, so no separate flush is needed.
+    entire_logging.commit_workspace(workspace_repo, f"MLE submission: {competition_id}")
+
+    if not _resolve_log_upload_consent(upload_flag):
+        click.echo("  Logs:    code + AI session captured locally; upload skipped.")
+        return
+
+    remote = _resolve_logs_remote("mle", None, config, logs_remote_override)
+    if not remote:
+        click.echo(
+            "  Logs:    consented, but no repository is configured to push to.\n"
+            "           Re-run 'aicodinggym configure' or pass --logs-remote URL."
+        )
+        return
+
+    code_ok, code_info = entire_logging.push_branch(
+        workspace_repo, remote_url=remote, dest_branch=competition_id, key_path=key_path,
+    )
+    if code_ok:
+        click.echo(f"  Code:    pushed to branch '{code_info}'")
+    else:
+        _warn(f"MLE code push failed: {code_info}")
+
+    if entire_logging.is_enabled(workspace_repo) and entire_logging.has_sessions(workspace_repo):
+        ok, info = entire_logging.upload(
+            workspace_repo, remote_url=remote, benchmark="mle", problem_id=competition_id,
+            user_id=user_id, key_path=key_path, cli_version=__version__,
+        )
+        if ok:
+            click.echo(f"  Logs:    uploaded for research (branch {info})")
+        else:
+            _warn(f"AI session log upload failed: {info}")
+    elif not entire_logging.is_available():
+        click.echo(
+            f"  Logs:    AI session not captured ('entire' not installed).\n"
+            f"           Run '{_configure_hint(user_id)}' to enable logging next time."
+        )
+
+
+def _configure_logging(upload_logs_flag: bool | None) -> None:
+    """During configure: record consent (if given) and offer to install Entire."""
+    if upload_logs_flag is not None:
+        set_logging_consent(upload_logs_flag)
+
+    if entire_logging.is_available():
+        ver = entire_logging.version()
+        click.echo(f"  Logging:     Entire detected ({ver or 'installed'})")
+        return
+
+    click.echo(
+        "\nOptional — AI workflow logging:\n"
+        "  AI Coding Gym can capture your AI coding sessions (via Entire,\n"
+        "  https://entire.io) and, only with your consent at submit, upload them\n"
+        "  for research. Uploaded data is de-identified/anonymized. Needs the\n"
+        "  'entire' CLI."
+    )
+    if not sys.stdin.isatty():
+        click.echo(f"  Install later with:\n    {entire_logging.INSTALL_COMMAND}")
+        return
+    if click.confirm("Install the Entire CLI now?", default=True):
+        ok, msg = entire_logging.install()
+        if ok:
+            click.echo(f"  Entire: {msg}")
+        else:
+            _warn(
+                f"Could not install Entire automatically: {msg}\n"
+                f"  Install manually: {entire_logging.INSTALL_COMMAND}"
+            )
+    else:
+        click.echo(f"  Skipped. Install later with:\n    {entire_logging.INSTALL_COMMAND}")
+
+
 # ── Top-level group ──────────────────────────────────────────────────────────
 
 
@@ -369,7 +593,12 @@ def main():
     help="Default workspace directory for cloning repositories. "
          "Defaults to the current working directory.",
 )
-def configure(user_id: str, workspace_dir: str | None):
+@click.option(
+    "--upload-logs/--no-upload-logs", "upload_logs", default=None,
+    help="Pre-set consent for uploading de-identified AI session logs for "
+         "research (otherwise you're asked once, on your first submit).",
+)
+def configure(user_id: str, workspace_dir: str | None, upload_logs: bool | None):
     """Configure credentials and register SSH key with aicodinggym.com.
 
     Generates an SSH key pair locally (stored in ~/.aicodinggym/),
@@ -396,15 +625,18 @@ def configure(user_id: str, workspace_dir: str | None):
         private_key_path, public_key = generate_ssh_key_pair(user_id)
 
         click.echo("Registering public key with aicodinggym.com...")
+        existing = load_config()
+        submission_repo_url = existing.get("submission_repo_url")
         try:
             data = api_configure(user_id, public_key)
             repo_name = data.get("repo_name")
             if not repo_name:
                 _error("Server did not return a repository name. Please try again or contact support.")
+            # Writable repo we can push AI-session logs to (CR/MLE upload target).
+            submission_repo_url = data.get("repo_url") or submission_repo_url
         except APIError as e:
             if "409" in str(e):
                 click.echo("Key already registered, reusing existing configuration.")
-                existing = load_config()
                 repo_name = existing.get("repo_name", f"submission-{user_id}")
             else:
                 raise
@@ -417,6 +649,8 @@ def configure(user_id: str, workspace_dir: str | None):
             "private_key_path": str(private_key_path),
             "workspace_dir": resolved_workspace,
         }
+        if submission_repo_url:
+            config["submission_repo_url"] = submission_repo_url
         save_config(config)
 
         _install_gym_environment(Path(resolved_workspace))
@@ -428,9 +662,13 @@ def configure(user_id: str, workspace_dir: str | None):
             f"  Repository:  {repo_name}\n"
             f"  Workspace:   {resolved_workspace}\n"
             f"  SSH Key:     {private_key_path}\n"
-            f"  Config:      ~/.aicodinggym/config.json\n"
-            f"\n"
-            f"You can now use 'aicodinggym swe', 'aicodinggym mle', and 'aicodinggym cr' commands."
+            f"  Config:      ~/.aicodinggym/config.json"
+        )
+
+        _configure_logging(upload_logs)
+
+        click.echo(
+            "\nYou can now use 'aicodinggym swe', 'aicodinggym mle', and 'aicodinggym cr' commands."
         )
     except APIError as e:
         _error(str(e))
@@ -536,7 +774,14 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     if not success:
         _error(msg)
 
+    # Record the user's writable repo (one repo, many branches) so CR/MLE logs
+    # can target it too. Only set if not already configured.
+    if repo_url and not config.get("submission_repo_url"):
+        config["submission_repo_url"] = repo_url
+        save_config(config)
+
     _install_gym_environment(workspace / problem_id)
+    _setup_logging(workspace / problem_id, user_id=uid)
 
     click.echo(
         f"\nSuccessfully fetched problem: {problem_id}\n"
@@ -563,8 +808,17 @@ def swe_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     "--workspace-dir", default=None, type=click.Path(),
     help="Workspace directory. Overrides configured/cached value.",
 )
+@click.option(
+    "--upload-logs/--no-upload-logs", "upload_logs", default=None,
+    help="Override consent for uploading de-identified AI session logs.",
+)
+@click.option(
+    "--logs-remote", default=None,
+    help="Git URL to push AI session logs to (defaults to this problem's repo).",
+)
 def swe_submit(problem_id: str, user_id: str | None, message: str | None,
-               force: bool, workspace_dir: str | None):
+               force: bool, workspace_dir: str | None,
+               upload_logs: bool | None, logs_remote: str | None):
     """Submit your SWE-bench solution by committing and pushing changes.
 
     Stages all changes, commits them, pushes to the remote, and notifies
@@ -655,6 +909,14 @@ def swe_submit(problem_id: str, user_id: str | None, message: str | None,
         f"  Status:  Pushed and backend notified\n"
         f"\n"
         f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/swe/{problem_id}')}"
+    )
+
+    # The solution commit above already triggered Entire's checkpoint, so no
+    # flush is needed here — just upload (with consent).
+    _maybe_upload_logs(
+        problem_dir, benchmark="swe", problem_id=problem_id, user_id=uid,
+        key_path=key_path, config=config, creds=creds, upload_flag=upload_logs,
+        logs_remote_override=logs_remote,
     )
 
 
@@ -1030,6 +1292,7 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
         _error(msg)
 
     _install_gym_environment(workspace / problem_id)
+    _setup_logging(workspace / problem_id, user_id=uid)
 
     problem_dir = workspace / problem_id
 
@@ -1080,8 +1343,21 @@ def cr_fetch(problem_id: str, user_id: str | None, workspace_dir: str | None):
     "-m", "--message", "review_text",
     help="Inline review text.",
 )
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Overrides configured/cached value.",
+)
+@click.option(
+    "--upload-logs/--no-upload-logs", "upload_logs", default=None,
+    help="Override consent for uploading de-identified AI session logs.",
+)
+@click.option(
+    "--logs-remote", default=None,
+    help="Git URL to push AI session logs to (defaults to your submission repo).",
+)
 def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
-              review_text: str | None):
+              review_text: str | None, workspace_dir: str | None,
+              upload_logs: bool | None, logs_remote: str | None):
     """Submit a code review for a Code Review challenge.
 
     Reads your review from a file (-f), inline text (-m), or piped stdin,
@@ -1132,6 +1408,18 @@ def cr_submit(problem_id: str, user_id: str | None, review_file: str | None,
         f"\n"
         f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/cr/{problem_id}')}"
     )
+
+    # CR clones a read-only PR, so logs upload to the user's own submission repo.
+    # The CR flow makes no commit, so flush=True materialises the checkpoint.
+    creds = load_credentials().get(problem_id)
+    workspace = _resolve_workspace(config, workspace_dir or (creds or {}).get("workspace_dir"))
+    problem_dir = workspace / problem_id
+    if problem_dir.exists():
+        _maybe_upload_logs(
+            problem_dir, benchmark="cr", problem_id=problem_id, user_id=uid,
+            key_path=_safe_key_path(config, creds), config=config, creds=creds,
+            upload_flag=upload_logs, logs_remote_override=logs_remote, flush=True,
+        )
 
 
 # ── mle group ────────────────────────────────────────────────────────────────
@@ -1191,6 +1479,10 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
         _error(str(e))
 
     _install_gym_environment(workspace / competition_id)
+    # MLE workspaces aren't git repos: init one so the solution code can be
+    # pushed on submit and Entire can attach for session capture.
+    entire_logging.ensure_git_repo(workspace / competition_id)
+    _setup_logging(workspace / competition_id, user_id=uid)
 
     click.echo(
         f"\nDataset downloaded to: {dest_path}\n"
@@ -1210,8 +1502,21 @@ def mle_download(competition_id: str, user_id: str | None, workspace_dir: str | 
     "--message", "-m", default=None,
     help="Description of your submission (optional).",
 )
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Overrides configured value.",
+)
+@click.option(
+    "--upload-logs/--no-upload-logs", "upload_logs", default=None,
+    help="Override consent for uploading de-identified AI session logs.",
+)
+@click.option(
+    "--logs-remote", default=None,
+    help="Git URL to push AI session logs to (defaults to your submission repo).",
+)
 def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
-               message: str | None):
+               message: str | None, workspace_dir: str | None,
+               upload_logs: bool | None, logs_remote: str | None):
     """Submit a prediction CSV for an MLE-bench competition.
 
     Uploads your prediction CSV directly to the AI Coding Gym server
@@ -1266,3 +1571,14 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     if score is not None:
         click.echo(f"  Score:   {score}\n")
     click.echo(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
+
+    # Push the user's solution code to a <competition_id> branch and (with
+    # consent) the AI session logs, both to the user's own repo.
+    workspace = _resolve_workspace(config, workspace_dir)
+    competition_dir = workspace / competition_id
+    if competition_dir.exists():
+        _maybe_submit_mle_artifacts(
+            competition_dir, competition_id=competition_id, user_id=uid, config=config,
+            key_path=_safe_key_path(config), upload_flag=upload_logs,
+            logs_remote_override=logs_remote,
+        )
