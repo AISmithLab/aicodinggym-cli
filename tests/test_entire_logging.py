@@ -108,6 +108,49 @@ def test_commit_workspace_excludes_heavy_artifacts(tmp_path):
 
 # ── push_branch (MLE code) ───────────────────────────────────────────────────
 
+def test_push_branch_force_overwrites_stable_branch(tmp_path):
+    # The MLE code branch is named after the competition and force-pushed, so the
+    # latest submission wins (and `mle restore` has a predictable name to pull).
+    ws = tmp_path / "comp"
+    ws.mkdir()
+    el.ensure_git_repo(ws)
+    (ws / "solution.py").write_text("v1\n")
+    el.commit_workspace(ws, "submit 1")
+    bare = _bare_remote(tmp_path)
+
+    ok1, b1 = el.push_branch(ws, remote_url=str(bare),
+                             dest_branch="spaceship-titanic", key_path=None, force=True)
+    (ws / "solution.py").write_text("v2\n")
+    el.commit_workspace(ws, "submit 2")
+    ok2, b2 = el.push_branch(ws, remote_url=str(bare),
+                             dest_branch="spaceship-titanic", key_path=None, force=True)
+
+    assert ok1 and ok2 and b1 == b2 == "spaceship-titanic"
+    assert _remote_branches(bare) == {"spaceship-titanic"}  # one stable branch
+    assert _git(["show", "spaceship-titanic:solution.py"], bare).stdout == "v2\n"
+
+
+# ── ensure_commit_linking (suppresses Entire's per-commit prompt) ─────────────
+
+def test_ensure_commit_linking_sets_always_and_merges(tmp_path):
+    repo = tmp_path / "r"
+    (repo / ".entire").mkdir(parents=True)
+    el.ensure_commit_linking(repo)
+    settings = repo / ".entire" / "settings.local.json"
+    assert json.loads(settings.read_text())["commit_linking"] == "always"
+
+    # Preserves unrelated keys and is idempotent.
+    settings.write_text(json.dumps({"telemetry": False}))
+    el.ensure_commit_linking(repo)
+    data = json.loads(settings.read_text())
+    assert data == {"telemetry": False, "commit_linking": "always"}
+
+
+def test_ensure_commit_linking_noop_without_entire_dir(tmp_path):
+    el.ensure_commit_linking(tmp_path)  # no .entire -> must not create anything
+    assert not (tmp_path / ".entire").exists()
+
+
 def test_push_branch_pushes_to_unique_branch_without_overwrite(tmp_path):
     ws = tmp_path / "comp"
     ws.mkdir()

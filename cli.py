@@ -62,6 +62,7 @@ from .git_ops import (
     clone_repo_cr,
     generate_ssh_key_pair,
     reset_to_setup_commit,
+    restore_branch,
     run_git_command,
 )
 
@@ -490,92 +491,117 @@ def _maybe_submit_mle_artifacts(workspace_repo: Path, *, competition_id: str,
                                 user_id: str, config: dict, key_path: Path | None,
                                 upload_flag: bool | None,
                                 logs_remote_override: str | None) -> str:
-    """MLE submit: push the solution code and (when captured) the AI session logs
-    to the user's own repo, gated by the single log-upload consent. Each goes to
-    a unique per-submission branch so prior submissions are never overwritten.
-    The CSV itself already went to the API. Returns a status block (or "").
+    """MLE submit: always push the user's solution code to their submission repo,
+    and — only with consent — also upload the captured AI session logs.
+
+    Pushing the code is the whole point of ``submit`` and it goes to the user's
+    *own* repo, so it is NOT gated on research-log consent; only the
+    de-identified AI session upload is. The code lands on a stable branch named
+    after the competition (overwritten each submit, so ``mle restore`` has a
+    predictable name to pull); logs land on a unique per-submission branch so
+    prior sessions are never overwritten. The CSV itself already went to the
+    API. Returns a status block (or "").
     """
     workspace_repo = Path(workspace_repo)
     if not (workspace_repo / ".git").exists():
         return ""  # workspace was never initialised (e.g. downloaded pre-upgrade)
 
-    # Commit the solution code locally. With Entire enabled this commit also
-    # materialises the AI session checkpoint, so no separate flush is needed.
+    # Commit the solution code locally. With Entire enabled, this commit also
+    # captures the AI session checkpoint (commit_linking is always on) — no
+    # separate flush needed. The session is uploaded only with consent, below.
     entire_logging.commit_workspace(workspace_repo, f"MLE submission: {competition_id}")
-
-    if not _resolve_log_upload_consent(upload_flag):
-        return "  Logs:    code + AI session captured locally; upload skipped."
 
     remote = _resolve_logs_remote("mle", None, config, logs_remote_override)
     if not remote:
         return (
-            "  Logs:    consented, but no repository is configured to push to.\n"
+            "  Code:    committed locally, but no submission repository is configured.\n"
             "           Re-run 'aicodinggym configure' or pass --logs-remote URL."
         )
 
-    # One stamp ties this submission's code branch and log branch together, and
-    # makes both unique so re-submissions never overwrite earlier ones.
-    stamp = entire_logging.new_stamp()
     lines: list[str] = []
 
+    # 1) Always push the solution code — it's the user's own repo and the point
+    #    of submitting; independent of research-log consent.
     code_ok, code_info = entire_logging.push_branch(
-        workspace_repo, remote_url=remote,
-        dest_branch=f"{competition_id}/{stamp}", key_path=key_path,
+        workspace_repo, remote_url=remote, dest_branch=competition_id,
+        key_path=key_path, force=True,
     )
     if code_ok:
         lines.append(f"  Code:    pushed to branch '{code_info}'")
+        lines.append(f"           Restore later with: aicodinggym mle restore {competition_id}")
     else:
         _warn(f"MLE code push failed: {code_info}")
 
-    if entire_logging.is_enabled(workspace_repo) and entire_logging.has_sessions(workspace_repo):
+    # 2) Upload the de-identified AI session logs only with consent.
+    if not entire_logging.is_available():
+        lines.append("  Logs:    AI session not captured ('entire' not installed).")
+        lines.append(f"           Run '{_configure_hint(user_id)}' to enable logging next time.")
+    elif not (entire_logging.is_enabled(workspace_repo)
+              and entire_logging.has_sessions(workspace_repo)):
+        pass  # no AI session was captured — stay quiet
+    elif not _resolve_log_upload_consent(upload_flag):
+        lines.append("  Logs:    AI session captured locally; upload skipped.")
+    else:
         ok, info = entire_logging.upload(
             workspace_repo, remote_url=remote, benchmark="mle", problem_id=competition_id,
             user_id=user_id, key_path=key_path, cli_version=__version__,
-            submission_stamp=stamp,
+            submission_stamp=entire_logging.new_stamp(),
         )
         if ok:
             lines.append(f"  Logs:    uploaded for research (branch {info})")
         else:
             _warn(f"AI session log upload failed: {info}")
-    elif not entire_logging.is_available():
-        lines.append("  Logs:    AI session not captured ('entire' not installed).")
-        lines.append(f"           Run '{_configure_hint(user_id)}' to enable logging next time.")
 
     return "\n".join(lines)
 
 
 def _configure_logging(upload_logs_flag: bool | None) -> None:
-    """During configure: record consent (if given) and offer to install Entire."""
-    if upload_logs_flag is not None:
-        set_logging_consent(upload_logs_flag)
+    """During configure: offer to install Entire, then record upload consent.
 
+    Consent is resolved here — where a human is reliably at the keyboard —
+    rather than only at submit. Later submits are often non-interactive (e.g.
+    driven by an AI agent, where stdin is not a TTY); recording the choice now
+    gives them an answer to act on instead of silently skipping the upload.
+    """
     if entire_logging.is_available():
         ver = entire_logging.version()
         click.echo(f"  Logging:     Entire detected ({ver or 'installed'})")
-        return
-
-    click.echo(
-        "\nOptional — AI workflow logging:\n"
-        "  AI Coding Gym can capture your AI coding sessions (via Entire,\n"
-        "  https://entire.io) and, only with your consent at submit, upload them\n"
-        "  for research. Uploaded data is de-identified/anonymized. Needs the\n"
-        "  'entire' CLI."
-    )
-    if not sys.stdin.isatty():
-        click.echo(f"  Install later with:\n    {entire_logging.INSTALL_COMMAND}")
-        return
-    if click.confirm("Install the Entire CLI now?", default=True):
-        click.echo("Installing Entire (downloading a binary; this may take a minute)...")
-        ok, msg = entire_logging.install()
-        if ok:
-            click.echo(f"  Entire: {msg}")
-        else:
-            _warn(
-                f"Could not install Entire automatically: {msg}\n"
-                f"  Install manually: {entire_logging.INSTALL_COMMAND}"
-            )
     else:
-        click.echo(f"  Skipped. Install later with:\n    {entire_logging.INSTALL_COMMAND}")
+        click.echo(
+            "\nOptional — AI workflow logging:\n"
+            "  AI Coding Gym can capture your AI coding sessions (via Entire,\n"
+            "  https://entire.io) and, only with your consent, upload them for\n"
+            "  research. Uploaded data is de-identified/anonymized. Needs the\n"
+            "  'entire' CLI."
+        )
+        if not sys.stdin.isatty():
+            click.echo(f"  Install later with:\n    {entire_logging.INSTALL_COMMAND}")
+        elif click.confirm("Install the Entire CLI now?", default=True):
+            click.echo("Installing Entire (downloading a binary; this may take a minute)...")
+            ok, msg = entire_logging.install()
+            if ok:
+                click.echo(f"  Entire: {msg}")
+            else:
+                _warn(
+                    f"Could not install Entire automatically: {msg}\n"
+                    f"  Install manually: {entire_logging.INSTALL_COMMAND}"
+                )
+        else:
+            click.echo(f"  Skipped. Install later with:\n    {entire_logging.INSTALL_COMMAND}")
+
+    # Record the standing upload consent now. An explicit flag wins; otherwise
+    # ask once (only with a TTY and no prior choice) so non-interactive submits
+    # have an answer. The submit-time prompt remains as a fallback for anyone who
+    # configured non-interactively.
+    if upload_logs_flag is not None:
+        set_logging_consent(upload_logs_flag)
+    elif get_logging_consent() is None and sys.stdin.isatty():
+        granted = click.confirm("\n" + _CONSENT_PROMPT, default=False)
+        set_logging_consent(granted)
+        click.echo(
+            "  Consent recorded — change it anytime with\n"
+            "    'aicodinggym configure --upload-logs'  (or --no-upload-logs)."
+        )
 
 
 # ── Top-level group ──────────────────────────────────────────────────────────
@@ -1662,3 +1688,68 @@ def mle_submit(competition_id: str, csv_path: str, user_id: str | None,
     summary.append("")
     summary.append(f"View results at: {_hyperlink(f'https://aicodinggym.com/challenges/mle/{competition_id}')}")
     click.echo("\n".join(summary))
+
+
+@mle.command("restore")
+@click.argument("competition_id")
+@click.option("--user-id", default=None, help="Override configured user ID.")
+@click.option(
+    "--workspace-dir", default=None, type=click.Path(),
+    help="Workspace directory. Overrides configured value.",
+)
+@click.option(
+    "--branch", default=None,
+    help="Branch to restore (defaults to the competition name). Pass a full "
+         "'<competition>/<stamp>' branch to restore an older submission.",
+)
+@click.option(
+    "--remote", default=None,
+    help="Git URL to restore from (defaults to your submission repo).",
+)
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Overwrite uncommitted local changes in the workspace.",
+)
+def mle_restore(competition_id: str, user_id: str | None, workspace_dir: str | None,
+                branch: str | None, remote: str | None, force: bool):
+    """Restore a competition workspace from your submission repo.
+
+    Pulls the solution code you pushed on a previous 'mle submit' back into your
+    workspace — e.g. to pick up on another machine or recover after a reset. Your
+    downloaded dataset and other gitignored files are left untouched.
+
+    \b
+    EXAMPLE:
+      aicodinggym mle restore spaceship-titanic
+      aicodinggym mle restore spaceship-titanic --branch spaceship-titanic/20260608T213116Z-5252df01
+    """
+    config = load_config()
+    uid = _resolve_user_id(config, user_id)
+
+    remote_url = _resolve_logs_remote("mle", None, config, remote)
+    if not remote_url:
+        _error(
+            "No submission repository is configured to restore from.\n"
+            "Run 'aicodinggym configure --user-id YOUR_USER_ID' first, or pass --remote URL."
+        )
+
+    workspace = _resolve_workspace(config, workspace_dir)
+    target = workspace / competition_id
+    branch_name = branch or competition_id
+
+    click.echo(f"Restoring '{branch_name}' from your submission repo into {target}...")
+    ok, msg = restore_branch(
+        remote_url, branch_name, str(target),
+        key_path=_safe_key_path(config), force=force,
+    )
+    if not ok:
+        _error(msg)
+
+    # Re-arm local AI-session capture for continued work in the restored repo.
+    _setup_logging(target, user_id=uid)
+
+    click.echo(
+        f"\n{msg}\n"
+        f"\nNext step: continue working, then submit with:\n"
+        f"  aicodinggym mle submit {competition_id} -F your_predictions.csv"
+    )

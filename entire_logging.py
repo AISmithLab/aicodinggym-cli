@@ -169,9 +169,42 @@ def setup(repo_dir: Path, *, init_git: bool = False) -> tuple[bool, str]:
                 if add.returncode == 0:
                     enabled_agents.append(agent_name)
 
+        # Suppress Entire's per-commit "link this session?" prompt up front, so
+        # the user's own agent commits during the session aren't interrupted.
+        ensure_commit_linking(repo_dir)
         return True, "capturing AI sessions for: " + ", ".join(enabled_agents)
     except Exception as e:  # noqa: BLE001 - logging must never break fetch
         return False, str(e)
+
+
+def ensure_commit_linking(repo_dir: Path) -> None:
+    """Make Entire link every commit to the active AI session without asking.
+
+    Entire's ``prepare-commit-msg`` hook otherwise interactively prompts ("link
+    this commit to session context?") on every commit unless ``commit_linking``
+    is set in ``.entire/settings.local.json``. We always set it to ``"always"``
+    so Entire never asks: capture stays local-only, and the single consent
+    question (ours) gates only whether the captured session is *uploaded* at
+    submit. Never raises.
+    """
+    try:
+        settings = Path(repo_dir) / ".entire" / "settings.local.json"
+        if not settings.parent.is_dir():
+            return  # Entire isn't set up in this repo
+        data: dict = {}
+        if settings.exists():
+            try:
+                loaded = json.loads(settings.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        if data.get("commit_linking") == "always":
+            return
+        data["commit_linking"] = "always"
+        settings.write_text(json.dumps(data, indent=2) + "\n")
+    except Exception:  # noqa: BLE001 - never let this break setup/submit
+        pass
 
 
 def flush(repo_dir: Path) -> None:
@@ -185,6 +218,7 @@ def flush(repo_dir: Path) -> None:
     if not is_available() or not is_enabled(repo_dir):
         return
     try:
+        ensure_commit_linking(repo_dir)  # this commit must not trigger a prompt
         _git(
             ["-c", "user.name=AI Coding Gym", "-c", "user.email=logs@aicodinggym.com",
              "commit", "--allow-empty", "-m", _FLUSH_MESSAGE],
@@ -204,6 +238,7 @@ def commit_workspace(repo_dir: Path, message: str) -> bool:
     if not (Path(repo_dir) / ".git").exists():
         return False
     try:
+        ensure_commit_linking(repo_dir)  # this commit must not trigger a prompt
         _git(["add", "-A"], cwd=repo_dir)
         res = _git(
             ["-c", "user.name=AI Coding Gym", "-c", "user.email=logs@aicodinggym.com",
@@ -216,20 +251,25 @@ def commit_workspace(repo_dir: Path, message: str) -> bool:
 
 
 def push_branch(repo_dir: Path, *, remote_url: str, dest_branch: str,
-                key_path: Path | None = None) -> tuple[bool, str]:
-    """Push the current HEAD to a fresh ``dest_branch`` on ``remote_url``.
+                key_path: Path | None = None, force: bool = False) -> tuple[bool, str]:
+    """Push the current HEAD to ``dest_branch`` on ``remote_url``.
 
-    Used for MLE to push the user's solution code. The caller passes a unique,
-    per-submission branch name (see :func:`new_stamp`), so we do NOT force-push:
-    each submission lands on its own branch and previous ones are preserved.
-    Returns (ok, branch_or_error). Never raises.
+    Used for MLE to push the user's solution code. ``force=True`` overwrites the
+    branch — used for the stable, competition-named code branch so the latest
+    submission wins and ``mle restore`` has a predictable name to pull. The new
+    tip still has every prior submission commit as an ancestor, so nothing is
+    truly lost. ``force=False`` refuses to clobber an existing branch (used for
+    unique, per-submission log branches). Returns (ok, branch_or_error). Never
+    raises.
     """
     try:
         safe = _safe_ref(dest_branch)
         refspec = f"HEAD:refs/heads/{safe}"
-        res = git_ops.run_git_command(
-            ["git", "push", remote_url, refspec], str(repo_dir), key_path,
-        )
+        cmd = ["git", "push"]
+        if force:
+            cmd.append("--force")
+        cmd += [remote_url, refspec]
+        res = git_ops.run_git_command(cmd, str(repo_dir), key_path)
         if res.returncode != 0:
             return False, (res.stderr or "git push failed").strip()
         return True, safe
