@@ -47,6 +47,9 @@ aicodinggym configure --user-id USER_ID [--workspace-dir DIR]
 |---|---|---|
 | `--user-id` | Yes | Your AI Coding Gym user ID |
 | `--workspace-dir` | No | Default workspace directory (default: cwd) |
+| `--upload-logs` / `--no-upload-logs` | No | Pre-set consent for uploading de-identified AI session logs for research. If unset, you're asked once on your first submit. |
+
+On first run, if the [Entire](https://entire.io) CLI isn't installed, `configure` offers to install it (used for [AI workflow logging](#ai-workflow-logging-entire)).
 
 ---
 
@@ -72,6 +75,8 @@ aicodinggym swe submit PROBLEM_ID [--message MSG] [--force] [--user-id ID] [--wo
 |---|---|
 | `--message, -m` | Commit message (auto-generated if omitted) |
 | `--force` | Force push with `--force-with-lease` |
+| `--upload-logs` / `--no-upload-logs` | Override consent for uploading de-identified AI session logs |
+| `--logs-remote` | Git URL to push AI session logs to (defaults to this problem's repo) |
 
 #### `aicodinggym swe test PROBLEM_ID`
 
@@ -137,6 +142,8 @@ aicodinggym mle submit COMPETITION_ID -F FILE [--user-id ID] [--message MSG]
 |---|---|---|
 | `-F` | Yes | Path to prediction CSV file |
 | `--message, -m` | No | Submission description |
+| `--upload-logs` / `--no-upload-logs` | No | Override consent for uploading de-identified AI session logs |
+| `--logs-remote` | No | Git URL to push AI session logs to (defaults to your submission repo) |
 
 ---
 
@@ -169,6 +176,65 @@ echo "My review" | aicodinggym cr submit PROBLEM_ID
 | `-f, --file` | Path to a file containing your review (e.g. `review.md`) |
 | `-m, --message` | Inline review text |
 | stdin | Pipe review text from stdin |
+| `--upload-logs` / `--no-upload-logs` | Override consent for uploading de-identified AI session logs |
+| `--logs-remote` | Git URL to push AI session logs to (defaults to your submission repo) |
+
+---
+
+## AI Workflow Logging (Entire)
+
+AI Coding Gym can optionally capture **how** a solution was produced — the AI
+agent prompts, responses, tool calls and files touched — for research. This is
+powered by the [Entire](https://entire.io) CLI, which hooks into git and stores
+sessions on a separate `entire/checkpoints/v1` branch (it never adds commits to
+your working branch).
+
+**Consent first.** Capture is **local only** until you opt in. The first time
+you `submit` (unless already configured), you're asked once:
+
+> AI Coding Gym can upload this AI coding session (prompts, responses, files
+> changed) for research only. Data is de-identified/anonymized before use.
+
+Your choice is saved in `~/.aicodinggym/config.json`. Set it ahead of time with
+`aicodinggym configure --upload-logs` / `--no-upload-logs`, or override per
+submit with `--upload-logs` / `--no-upload-logs`. In non-interactive sessions
+with no recorded choice, nothing is uploaded.
+
+**One repo, many branches.** All three benchmarks log to your **single** repo
+(the writable per-user repo — one repo, many branches), so a log is identified
+by its branch name even though the repo holds many problems. SWE `fetch` records
+that repo URL (`submission_repo_url`) so CR/MLE reuse it; the cloned CR PR repo
+is read-only and is never used as a target. Override with `--logs-remote` or the
+`AICODINGGYM_LOGS_REMOTE` env var.
+
+**Nothing is overwritten.** Every submission gets its own unique branch
+(`…/<submission-id>`, a UTC timestamp + random suffix). Re-submitting the same
+problem — or submitting it from a different directory or machine — adds a new
+branch and never deletes or clobbers a previous one.
+
+**How it works**
+
+1. `swe fetch` / `cr fetch` / `mle download` installs Entire's hooks so your
+   session is captured locally as you work. (MLE workspaces aren't git repos, so
+   a lightweight one is initialised — this also lets your solution code be
+   pushed on submit. The dataset under `data/` plus common model/checkpoint/cache
+   artifacts are gitignored.)
+   If the `entire` CLI isn't installed, you're pointed at `aicodinggym configure`
+   (which offers to install it) instead of being silently skipped.
+2. On `submit`, after consent, the captured `entire/checkpoints/v1` branch is
+   pushed to your repo on a unique per-submission branch
+   `aicodinggym-logs/<benchmark>/<problem_id>/<submission-id>`, with an
+   `aicodinggym-meta.json` file at the tip (problem id, benchmark, user, tool,
+   submission id, timestamp).
+3. **MLE also pushes your solution code** (notebooks/scripts/CSV; dataset and
+   heavy artifacts excluded) to `<competition_id>/<submission-id>`, gated by the
+   same consent. The two share a submission id so code and logs correlate. The
+   prediction CSV still goes to the scoring API as before.
+
+**Privacy.** Uploaded data is used solely for research and is
+de-identified/anonymized before use. Entire also redacts detected secrets when
+writing to the checkpoints branch (best-effort). Logging is entirely optional —
+if the `entire` binary isn't installed, fetch/submit work unchanged.
 
 ---
 
@@ -181,14 +247,23 @@ aicodinggym-cli/
 ├── config.py        # Config + credentials persistence (~/.aicodinggym/)
 ├── api.py           # HTTP client for aicodinggym.com/api
 ├── git_ops.py       # SSH key generation, git clone/commit/push/reset
+├── entire_logging.py # Optional AI-session capture/upload via the Entire CLI
+├── tests/           # pytest suite (logging, consent, remote resolution)
 └── pyproject.toml   # Package metadata and build config
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"   # installs pytest
+pytest                    # run the test suite
 ```
 
 ## Configuration Files
 
 | File | Purpose |
 |---|---|
-| `~/.aicodinggym/config.json` | Global config (user_id, repo_name, key path, workspace) |
+| `~/.aicodinggym/config.json` | Global config (user_id, repo_name, key path, workspace, log-upload consent, submission repo URL) |
 | `~/.aicodinggym/credentials.json` | Per-problem credentials (repo_url, branch, cached after fetch) |
 | `~/.aicodinggym/{user_id}_id_rsa` | SSH private key |
 | `~/.aicodinggym/{user_id}_id_rsa.pub` | SSH public key |

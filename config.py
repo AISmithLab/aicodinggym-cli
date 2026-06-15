@@ -18,7 +18,14 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 
 # Fields persisted in config.json
-_CONFIG_FIELDS = ("user_id", "repo_name", "private_key_path", "workspace_dir")
+_CONFIG_FIELDS = (
+    "user_id", "repo_name", "private_key_path", "workspace_dir",
+    # Writable repo to push AI-session logs to (Entire integration). Used for
+    # CR/MLE where the cloned repo is read-only or absent.
+    "submission_repo_url",
+    # AI-session upload consent: "granted" | "declined" (absent = not yet asked).
+    "entire_logging_consent",
+)
 
 
 def ensure_config_dir() -> Path:
@@ -78,6 +85,23 @@ def save_credentials(credentials: dict[str, dict[str, Any]]) -> None:
     """Persist per-problem credentials to ~/.aicodinggym/credentials.json."""
     ensure_config_dir()
     CREDENTIALS_PATH.write_text(json.dumps(credentials, indent=2) + "\n")
+
+
+def get_logging_consent() -> bool | None:
+    """Return AI-session upload consent: True/False, or None if never asked."""
+    value = load_config().get("entire_logging_consent")
+    if value == "granted":
+        return True
+    if value == "declined":
+        return False
+    return None
+
+
+def set_logging_consent(granted: bool) -> None:
+    """Persist the user's AI-session upload consent choice."""
+    config = load_config()
+    config["entire_logging_consent"] = "granted" if granted else "declined"
+    save_config(config)
 
 
 def require_config(config: dict[str, str], field: str, label: str) -> str:

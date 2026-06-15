@@ -308,6 +308,56 @@ def reset_to_setup_commit(problem_dir: str) -> tuple[bool, str]:
     return True, f"Reset to setup commit {setup_commit[:8]}.\nLocal changes discarded and untracked files removed."
 
 
+def restore_branch(remote_url: str, branch: str, target_dir: str,
+                   key_path: Optional[Path] = None,
+                   force: bool = False) -> tuple[bool, str]:
+    """Restore a competition workspace's tracked files from a remote ``branch``.
+
+    Fetches ``branch`` from ``remote_url`` and hard-resets ``target_dir`` to it.
+    Gitignored files already present (e.g. the downloaded dataset) are left
+    untouched — only tracked files are restored. Initialises a repo in place if
+    the directory isn't one yet. Refuses to discard uncommitted tracked changes
+    unless ``force`` is set. Returns (success, message).
+    """
+    _validate_git_ref(branch, "branch")
+    target = Path(target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+
+    if not (target / ".git").exists():
+        init = run_git_command(["git", "init", "-q"], str(target))
+        if init.returncode != 0:
+            return False, f"git init failed:\n{init.stderr}"
+
+    # Don't clobber real uncommitted work; gitignored files (the dataset) don't
+    # count. Only meaningful once the repo already has a commit history.
+    has_head = run_git_command(
+        ["git", "rev-parse", "--verify", "-q", "HEAD"], str(target)
+    ).returncode == 0
+    if has_head and not force:
+        status = run_git_command(["git", "status", "--porcelain"], str(target))
+        if status.stdout.strip():
+            return False, (
+                "Workspace has uncommitted changes. Commit them first, or re-run "
+                "with --force to overwrite them with the restored version."
+            )
+
+    fetch = run_git_command(["git", "fetch", remote_url, branch], str(target), key_path)
+    if fetch.returncode != 0:
+        return False, (
+            f"Could not fetch branch '{branch}':\n{fetch.stderr.strip()}\n"
+            "Make sure you've submitted this competition at least once."
+        )
+
+    reset = run_git_command(["git", "reset", "--hard", "FETCH_HEAD"], str(target))
+    if reset.returncode != 0:
+        return False, f"git reset failed:\n{reset.stderr}"
+
+    short = run_git_command(
+        ["git", "rev-parse", "--short", "HEAD"], str(target)
+    ).stdout.strip()
+    return True, f"Restored '{branch}' into {target} (at commit {short})."
+
+
 def check_tool_installed(tool_name: str) -> bool:
     """Check if a CLI tool is available on PATH."""
     return shutil.which(tool_name) is not None

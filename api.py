@@ -102,12 +102,16 @@ def cr_submit_review(user_id: str, problem_id: str, review: str) -> dict:
     })
 
 
-def mlebench_download_info(user_id: str, competition_id: str, dest_path: str) -> None:
-    """Download dataset for an MLE-bench competition directly to dest_path."""
+def mlebench_download_open(competition_id: str, chunk_size: int = 1 << 16):
+    """Open a streaming download for an MLE-bench dataset.
+
+    Returns (total_bytes, chunk_iterator). ``total_bytes`` is the server's
+    Content-Length, or 0 if it isn't advertised. Lets the caller drive a
+    progress bar while writing chunks to disk.
+    """
     resp = _get(f"competitions/{competition_id}/download", stream=True)
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
+    total = int(resp.headers.get("Content-Length") or 0)
+    return total, resp.iter_content(chunk_size=chunk_size)
 
 
 def mlebench_download_file(url: str, dest_path: str, timeout: int = 300) -> None:
