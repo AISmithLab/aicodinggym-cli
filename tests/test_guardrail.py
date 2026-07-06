@@ -1,8 +1,8 @@
 """Tests for the `aicodinggym guardrail` command group (Guardrail Gym Level 3).
 
 Covers: config session-id persistence, the API client request shapes, the CLI
-commands (help/parse, invalid plant-kind, no-session guard, start/attack/plant/
-status/reset/finish/info behaviour), and the dynamic objective-total scoreline.
+commands (help/parse, no-session guard, start/catalog/status/reset/finish/info
+plus the flat plant verbs), and the dynamic objective-total scoreline.
 Network is always mocked — no test hits a real backend.
 """
 
@@ -126,6 +126,12 @@ def test_group_lists_all_subcommands(runner):
     assert res.exit_code == 0
     for sub in ("start", "catalog", "status", "reset", "finish", "info"):
         assert sub in res.output
+
+
+def test_group_help_reflects_new_surface(runner):
+    res = runner.invoke(cli.main, ["guardrail", "--help"])
+    assert "catalog" in res.output
+    assert "attack" not in res.output
 
 
 @pytest.mark.parametrize("sub", [
