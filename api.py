@@ -3,6 +3,7 @@
 import gzip
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -124,6 +125,57 @@ def mlebench_download_file(url: str, dest_path: str, timeout: int = 300) -> None
                 f.write(chunk)
     except requests.RequestException as e:
         raise APIError(f"Download failed: {e}")
+
+
+# ── Guardrail Gym Level 3: "Assistant Pro" live red-team sessions ─────────────
+# These drive the /api/guardrails/live/* API. All side-effects are simulated by
+# the server (nothing is really sent/executed); the judge is deterministic.
+
+def guardrail_info() -> dict:
+    """Capability discovery: tools, objectives, medal thresholds, limits."""
+    return _get("guardrails/live/info").json()
+
+
+def guardrail_start(user_id: str) -> dict:
+    """Create a new live session. Returns {'sessionId', 'model', 'status', ...}."""
+    return _post("guardrails/live/session", {"userId": user_id})
+
+
+def guardrail_attack(session_id: str, message: str) -> dict:
+    """Send one attacker chat turn. Runs a live model call, so allow extra time."""
+    return _post(
+        "guardrails/live/turn",
+        {"sessionId": session_id, "message": message},
+        timeout=180,
+    )
+
+
+def guardrail_plant(session_id: str, plant_kind: str, args: dict) -> dict:
+    """Seed content into the app (indirect-injection setup) via a real feature."""
+    return _post(
+        "guardrails/live/plant",
+        {"sessionId": session_id, "plantKind": plant_kind, "args": args or {}},
+    )
+
+
+def guardrail_status(session_id: str) -> dict:
+    """Full session state: status, medal, captures, app view, transcript."""
+    return _get(f"guardrails/live/session/{quote(session_id)}").json()
+
+
+def guardrail_latest(user_id: str) -> dict:
+    """The user's most recent session. Returns {'session': <state>|None}."""
+    return _get(f"guardrails/live/latest?userId={quote(user_id)}").json()
+
+
+def guardrail_reset(session_id: str) -> dict:
+    """Reseed the app for a session (fresh inbox/files/scopes, same session id)."""
+    return _post(f"guardrails/live/session/{quote(session_id)}/reset", {})
+
+
+def guardrail_finish(session_id: str) -> dict:
+    """Close a session. Returns {'sessionId', 'status', 'medal', 'captures'}."""
+    return _post(f"guardrails/live/session/{quote(session_id)}/finish", {})
 
 
 def mlebench_submit_csv(user_id: str, competition_id: str, csv_path: str) -> dict:

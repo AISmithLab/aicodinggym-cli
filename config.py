@@ -25,6 +25,9 @@ _CONFIG_FIELDS = (
     "submission_repo_url",
     # AI-session upload consent: "granted" | "declined" (absent = not yet asked).
     "entire_logging_consent",
+    # Active Guardrail Gym "Assistant Pro" live-session id, so guardrail
+    # attack/plant/status/reset/finish commands don't need it passed each time.
+    "guardrail_session_id",
 )
 
 
@@ -101,6 +104,25 @@ def set_logging_consent(granted: bool) -> None:
     """Persist the user's AI-session upload consent choice."""
     config = load_config()
     config["entire_logging_consent"] = "granted" if granted else "declined"
+    save_config(config)
+
+
+def get_guardrail_session() -> str | None:
+    """Return the active Guardrail live-session id, or None if none is stored."""
+    return load_config().get("guardrail_session_id")
+
+
+def set_guardrail_session(session_id: str) -> None:
+    """Persist the active Guardrail live-session id."""
+    config = load_config()
+    config["guardrail_session_id"] = session_id
+    save_config(config)
+
+
+def clear_guardrail_session() -> None:
+    """Forget the active Guardrail live-session id (e.g. after finishing)."""
+    config = load_config()
+    config.pop("guardrail_session_id", None)
     save_config(config)
 
 
