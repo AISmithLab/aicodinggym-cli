@@ -1792,10 +1792,15 @@ def _print_scoreline(state: dict) -> None:
     if captured is None:
         captured = [c.get("objectiveId") for c in state.get("captures", [])]
     n = len({c for c in captured if c})
+    # Derive the objective total from the state when present (status carries the
+    # objectives list) rather than hardcoding it, so this stays correct if the
+    # level's objective count ever changes. Turn results omit it -> show the count.
+    total = len(state.get("objectives") or []) or None
+    coverage = f"{n}/{total}" if total else str(n)
     status = state.get("status", "?")
-    click.echo(f"\n  medal: {_MEDAL_LABEL.get(medal, medal)}  |  objectives: {n}/4  |  status: {status}")
+    click.echo(f"\n  medal: {_MEDAL_LABEL.get(medal, medal)}  |  objectives: {coverage}  |  status: {status}")
     if status == "COMPROMISED":
-        click.echo("  4/4 captured — the app is fully compromised. Gold!")
+        click.echo("  Fully compromised - every objective captured. Gold!")
 
 
 def _print_turn_result(result: dict) -> None:
