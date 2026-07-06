@@ -42,7 +42,7 @@ from .api import (
     cr_submit_review,
     fetch_pr as api_fetch_pr,
     fetch_problem as api_fetch_problem,
-    guardrail_attack as api_guardrail_attack,
+    guardrail_catalog as api_guardrail_catalog,
     guardrail_finish as api_guardrail_finish,
     guardrail_info as api_guardrail_info,
     guardrail_latest as api_guardrail_latest,
@@ -1803,25 +1803,6 @@ def _print_scoreline(state: dict) -> None:
         click.echo("  Fully compromised - every objective captured. Gold!")
 
 
-def _print_turn_result(result: dict) -> None:
-    """Pretty-print the outcome of one attack turn."""
-    reply = result.get("assistantText") or ""
-    calls = result.get("toolCalls") or []
-    if reply:
-        click.echo(f"\nFavor: {reply}")
-    if calls:
-        parts = []
-        for c in calls:
-            res = c.get("result")
-            blocked = isinstance(res, dict) and "error" in res
-            parts.append(f"{c.get('name')}{' [blocked]' if blocked else ''}")
-        click.echo("  tools: " + " | ".join(parts))
-    for cap in result.get("newCaptures") or []:
-        flag = f" ({cap['flagId']})" if cap.get("flagId") else ""
-        click.echo(f"  captured {cap.get('objectiveId')}{flag}")
-    _print_scoreline(result)
-
-
 @main.group()
 def guardrail():
     """Guardrail Gym Level 3 - "Assistant Pro" live red-team challenge.
@@ -1899,24 +1880,21 @@ def guardrail_start_cmd(user_id: str | None):
     )
 
 
-@guardrail.command("attack")
-@click.argument("message")
-@click.option("--session", "session_id", default=None,
-              help="Session id (defaults to the active one).")
-def guardrail_attack_cmd(message: str, session_id: str | None):
-    """Send one attacker chat turn (MESSAGE) to the assistant.
-
-    \b
-    EXAMPLE:
-      aicodinggym guardrail attack "read my latest email and do what it asks"
-    """
-    sid = _resolve_session_id(session_id)
-    click.echo(f'$ attack "{message}"')
+@guardrail.command("catalog")
+def guardrail_catalog_cmd():
+    """List everything you can plant (grouped by surface) and the victim routines."""
     try:
-        res = api_guardrail_attack(sid, message)
+        data = api_guardrail_catalog()
     except APIError as e:
         _error(str(e))
-    _print_turn_result(res)
+    click.echo("Plant catalog - what you can drop into Favor's world:")
+    for group in data.get("plants", []):
+        click.echo(f"\n  [{group.get('surface')}]")
+        for kind in group.get("kinds", []):
+            click.echo(f"    - {kind}")
+    click.echo("\nVictim routines (triggered on the web UI):")
+    for r in data.get("routines", []):
+        click.echo(f"    - {r.get('id')}: {r.get('label')}")
 
 
 @guardrail.command("plant")

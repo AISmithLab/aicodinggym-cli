@@ -141,13 +141,9 @@ def guardrail_start(user_id: str) -> dict:
     return _post("guardrails/live/session", {"userId": user_id})
 
 
-def guardrail_attack(session_id: str, message: str) -> dict:
-    """Send one attacker chat turn. Runs a live model call, so allow extra time."""
-    return _post(
-        "guardrails/live/turn",
-        {"sessionId": session_id, "message": message},
-        timeout=180,
-    )
+def guardrail_catalog() -> dict:
+    """Plant palette (grouped by surface) plus the victim routines you can run."""
+    return _get("guardrails/live/catalog").json()
 
 
 def guardrail_plant(session_id: str, plant_kind: str, args: dict) -> dict:
