@@ -128,7 +128,11 @@ def test_group_lists_all_subcommands(runner):
         assert sub in res.output
 
 
-@pytest.mark.parametrize("sub", ["start", "catalog", "status", "reset", "finish", "info"])
+@pytest.mark.parametrize("sub", [
+    "start", "catalog", "status", "reset", "finish", "info",
+    "email", "note", "event", "message", "webpage",
+    "payee", "contact", "request", "consent", "policy",
+])
 def test_subcommand_help_ok(runner, sub):
     res = runner.invoke(cli.main, ["guardrail", sub, "--help"])
     assert res.exit_code == 0
@@ -152,7 +156,7 @@ def test_attack_command_is_gone(runner):
 # ── CLI: no active session must fail cleanly and hit no network ────────────────
 
 @pytest.mark.parametrize("argv", [
-    ["guardrail", "plant", "save_note", "--content", "x"],
+    ["guardrail", "note", "--content", "x"],
     ["guardrail", "reset"],
     ["guardrail", "finish"],
 ])
@@ -184,20 +188,38 @@ def test_start_saves_session_and_prints_summary(runner, monkeypatch):
     assert "sess-new" in res.output and "gpt-4o" in res.output
 
 
-def test_plant_builds_args_from_options(runner, monkeypatch):
+def test_flat_email_verb_maps_to_receive_email(runner, monkeypatch):
     monkeypatch.setattr(cli, "get_guardrail_session", lambda: "sess-1")
     seen = {}
     def fake_plant(sid, kind, args):
         seen.update(sid=sid, kind=kind, args=args)
         return {"plantId": "em_p1"}
     monkeypatch.setattr(cli, "api_guardrail_plant", fake_plant)
-    res = runner.invoke(cli.main, ["guardrail", "plant", "receive_email",
+    res = runner.invoke(cli.main, ["guardrail", "email",
                                    "--from", "boss@corp.example", "--body", "do it"])
     assert res.exit_code == 0, res.output
     assert seen["kind"] == "receive_email"
     # Only provided options are sent (from -> "from"); unset options are omitted.
     assert seen["args"] == {"from": "boss@corp.example", "body": "do it"}
     assert "em_p1" in res.output
+
+
+def test_flat_payee_verb_maps_to_payee_plantkind(runner, monkeypatch):
+    monkeypatch.setattr(cli, "get_guardrail_session", lambda: "sess1")
+    calls = {}
+    monkeypatch.setattr(cli, "api_guardrail_plant",
+                        lambda sid, kind, args: calls.update(sid=sid, kind=kind, args=args)
+                        or {"plantId": "payee_p0"})
+    res = runner.invoke(cli.main, ["guardrail", "payee",
+                                   "--name", "Landlord LLC", "--account", "acct-attacker-999"])
+    assert res.exit_code == 0, res.output
+    assert calls["kind"] == "payee"
+    assert calls["args"] == {"name": "Landlord LLC", "account": "acct-attacker-999"}
+
+
+def test_old_plant_command_is_gone(runner):
+    res = runner.invoke(cli.main, ["guardrail", "plant", "receive_email"])
+    assert res.exit_code != 0
 
 
 def test_status_latest_path_when_no_session(runner, monkeypatch):
