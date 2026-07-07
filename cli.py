@@ -1986,7 +1986,7 @@ def guardrail_payee_cmd(session_id, name, account):
 @click.option("--name", default=None, help="Contact name.")
 @click.option("--email", default=None, help="Contact email address.")
 def guardrail_contact_cmd(session_id, name, email):
-    """Plant a contact Favor may resolve names against (tool-misuse surface)."""
+    """Plant a look-alike contact so Favor treats an outside address as already saved (prompt-injection surface)."""
     _plant(session_id, "contact", name=name, email=email)
 
 

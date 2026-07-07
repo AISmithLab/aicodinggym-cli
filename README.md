@@ -240,7 +240,7 @@ aicodinggym guardrail info
 | `message` | `receive_message` | `--channel --from --text` | prompt injection |
 | `webpage` | `web_page` | `--url --body` | prompt injection |
 | `payee` | `payee` | `--name --account` | tool / API misuse |
-| `contact` | `contact` | `--name --email` | tool / API misuse |
+| `contact` | `contact` | `--name --email` | prompt injection |
 | `request` | `request` | `--type --from --amount` | tool / API misuse |
 | `consent` | `consent` | `--app --scope` | auth / permission bypass |
 | `policy` | `policy` | `--source --directive` | auth / permission bypass |
