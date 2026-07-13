@@ -1886,8 +1886,17 @@ def guardrail_start_cmd(user_id: str | None, world: str):
     if not sid:
         _error("Server did not return a session id.")
     set_guardrail_session(sid)
-    set_guardrail_world(res.get("world") or world)
-    click.echo(f"Started {res.get('world') or world} session for '{uid}'.")
+    server_world = res.get("world")
+    effective_world = server_world or world
+    set_guardrail_world(effective_world)
+    if server_world is None:
+        click.echo(
+            f"Warning: the server did not report a world. It may be an older backend that\n"
+            f"does not support --world yet — this session is most likely 'assistant_pro', not '{world}'."
+        )
+    elif server_world != world:
+        click.echo(f"Warning: requested world '{world}' but the server started '{server_world}'.")
+    click.echo(f"Started {effective_world} session for '{uid}'.")
     click.echo(f"  session: {sid}")
     click.echo(f"  model:   {res.get('model')}")
     click.echo(f"  scopes:  {', '.join(res.get('scopes', []))}")
