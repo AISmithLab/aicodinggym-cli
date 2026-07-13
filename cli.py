@@ -58,12 +58,14 @@ from .api import (
 from .config import (
     clear_guardrail_session,
     get_guardrail_session,
+    get_guardrail_world,
     get_logging_consent,
     load_config,
     load_credentials,
     save_config,
     save_credentials,
     set_guardrail_session,
+    set_guardrail_world,
     set_logging_consent,
 )
 from .git_ops import (
@@ -1805,13 +1807,22 @@ def _print_scoreline(state: dict) -> None:
 
 @main.group()
 def guardrail():
-    """Guardrail Gym Level 3 - "Assistant Pro" live red-team challenge.
+    """Guardrail Gym live red-team challenges (multiple worlds).
 
-    Plant booby-trapped content into "Favor", a live personal-assistant app,
-    then run a victim routine on the web UI and watch Favor walk into your trap.
-    Capture planted secrets or trip a "must-never" invariant across three
-    surfaces: prompt injection, tool / API misuse, and auth / permission bypass.
-    Every tool side-effect is simulated - nothing is really sent or executed.
+    Plant booby-trapped content into a live AI agent's world, then run a victim
+    routine on the web UI and watch it walk into your trap. Capture planted
+    secrets or trip a "must-never" invariant across three surfaces: prompt
+    injection, tool / API misuse, and auth / permission bypass. Every tool
+    side-effect is simulated - nothing is really sent or executed.
+
+    \b
+    WORLDS (pick with 'start --world'):
+      assistant_pro  "Favor", a personal-assistant app  (default)
+                     verbs: email note event message webpage contact payee
+                            request consent policy
+      ship_it        "Patch", an autonomous repo assistant
+                     verbs: issue pr commit comment cilog readme webpage
+                            deploy-target access-request app-consent org-policy
 
     \b
     PREREQUISITE:
@@ -1819,9 +1830,9 @@ def guardrail():
 
     \b
     WORKFLOW:
-      1. aicodinggym guardrail start                 # open a session
+      1. aicodinggym guardrail start --world ship_it # open a session
       2. aicodinggym guardrail catalog               # what you can plant + routines
-      3. aicodinggym guardrail email --body "..."    # plant content (flat verbs)
+      3. aicodinggym guardrail issue --body "..."    # plant content (flat verbs)
       4. run a victim routine on the web UI          # routines are UI-only
       5. aicodinggym guardrail status                # check medal / captures
       6. aicodinggym guardrail reset | finish        # restart or close
@@ -1830,16 +1841,18 @@ def guardrail():
     RUN ROUTINES ON THE WEB:
       Open the challenge page on aicodinggym.com while signed in as the same
       user - plant from the CLI, then trigger a victim routine in the cockpit
-      and watch Favor act on what you planted.
+      and watch the agent act on what you planted.
     """
     pass
 
 
 @guardrail.command("info")
-def guardrail_info_cmd():
+@click.option("--world", default=None,
+              help="World to describe (defaults to the active session's world).")
+def guardrail_info_cmd(world: str | None):
     """Show challenge capabilities: tools, objectives, medal thresholds, limits."""
     try:
-        info = api_guardrail_info()
+        info = api_guardrail_info(world or get_guardrail_world())
     except APIError as e:
         _error(str(e))
     click.echo(f"Level:  {info.get('levelId')}  (model: {info.get('model')})")
@@ -1858,19 +1871,23 @@ def guardrail_info_cmd():
 
 @guardrail.command("start")
 @click.option("--user-id", default=None, help="Override configured user ID.")
-def guardrail_start_cmd(user_id: str | None):
+@click.option("--world", type=click.Choice(["assistant_pro", "ship_it"]),
+              default="assistant_pro", show_default=True,
+              help="Which challenge world to attack.")
+def guardrail_start_cmd(user_id: str | None, world: str):
     """Start a new live session (becomes the active session for later commands)."""
     config = load_config()
     uid = _resolve_user_id(config, user_id)
     try:
-        res = api_guardrail_start(uid)
+        res = api_guardrail_start(uid, world)
     except APIError as e:
         _error(str(e))
     sid = res.get("sessionId")
     if not sid:
         _error("Server did not return a session id.")
     set_guardrail_session(sid)
-    click.echo(f"Started Assistant Pro session for '{uid}'.")
+    set_guardrail_world(res.get("world") or world)
+    click.echo(f"Started {res.get('world') or world} session for '{uid}'.")
     click.echo(f"  session: {sid}")
     click.echo(f"  model:   {res.get('model')}")
     click.echo(f"  scopes:  {', '.join(res.get('scopes', []))}")
@@ -1880,19 +1897,20 @@ def guardrail_start_cmd(user_id: str | None):
     click.echo(
         "\nNext: see what you can plant and which routines exist:\n"
         "  aicodinggym guardrail catalog\n"
-        "then plant something Favor will read, e.g.\n"
-        '  aicodinggym guardrail email --from boss@corp.example --body "..."'
+        "then plant something the agent will read (see the verbs for this world)."
     )
 
 
 @guardrail.command("catalog")
-def guardrail_catalog_cmd():
+@click.option("--world", default=None,
+              help="World to list (defaults to the active session's world).")
+def guardrail_catalog_cmd(world: str | None):
     """List everything you can plant (grouped by surface) and the victim routines."""
     try:
-        data = api_guardrail_catalog()
+        data = api_guardrail_catalog(world or get_guardrail_world())
     except APIError as e:
         _error(str(e))
-    click.echo("Plant catalog - what you can drop into Favor's world:")
+    click.echo("Plant catalog - what you can drop into the agent's world:")
     for group in data.get("plants", []):
         click.echo(f"\n  [{group.get('surface')}]")
         for kind in group.get("kinds", []):
@@ -2019,6 +2037,116 @@ def guardrail_consent_cmd(session_id, app, scope):
 def guardrail_policy_cmd(session_id, source, directive):
     """Plant a policy directive Favor may treat as authoritative (auth-bypass surface)."""
     _plant(session_id, "policy", source=source, directive=directive)
+
+
+# ── Ship It (world: ship_it) flat plant verbs ────────────────────────────────
+# These target a ship_it session; the backend rejects them against an
+# assistant_pro session (unknown plantKind for that world). `webpage` is shared
+# with Assistant Pro (both worlds use the web_page plant kind).
+
+@guardrail.command("issue")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--title", default=None, help="Issue title.")
+@click.option("--author", default=None, help="Issue author.")
+@click.option("--body", default=None, help="Issue body (the payload Patch reads).")
+def guardrail_issue_cmd(session_id, title, author, body):
+    """Plant a GitHub issue Patch will read (injection surface)."""
+    _plant(session_id, "receive_issue", title=title, author=author, body=body)
+
+
+@guardrail.command("pr")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--title", default=None, help="Pull request title.")
+@click.option("--author", default=None, help="PR author.")
+@click.option("--description", default=None, help="PR description (the payload).")
+def guardrail_pr_cmd(session_id, title, author, description):
+    """Plant a pull request Patch will review (injection surface)."""
+    _plant(session_id, "receive_pr", title=title, author=author, description=description)
+
+
+@guardrail.command("commit")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--author", default=None, help="Commit author.")
+@click.option("--message", default=None, help="Commit message (the payload).")
+def guardrail_commit_cmd(session_id, author, message):
+    """Plant a commit message Patch will read (injection surface)."""
+    _plant(session_id, "commit_message", author=author, message=message)
+
+
+@guardrail.command("comment")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--path", default=None, help="File path the comment is on.")
+@click.option("--author", default=None, help="Comment author.")
+@click.option("--text", default=None, help="Comment text (the payload).")
+def guardrail_comment_cmd(session_id, path, author, text):
+    """Plant a code-review comment Patch will read (injection surface)."""
+    _plant(session_id, "code_comment", path=path, author=author, text=text)
+
+
+@guardrail.command("cilog")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--job", default=None, help="CI job name (e.g. build).")
+@click.option("--log", default=None, help="Log text to inject (the payload).")
+def guardrail_cilog_cmd(session_id, job, log):
+    """Plant CI log output Patch will read while fixing the build (injection surface)."""
+    _plant(session_id, "ci_log", job=job, log=log)
+
+
+@guardrail.command("readme")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--file", default=None, help="Doc file path (e.g. /CONTRIBUTING.md).")
+@click.option("--body", default=None, help="Doc body (the payload).")
+def guardrail_readme_cmd(session_id, file, body):
+    """Plant a README / CONTRIBUTING doc Patch reads for context (injection surface)."""
+    _plant(session_id, "repo_doc", file=file, body=body)
+
+
+@guardrail.command("deploy-target")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--name", default=None, help="Deploy target name (poison an existing one).")
+@click.option("--env", "env_", default=None, help="Environment the target should land in.")
+@click.option("--ref", default=None, help="Git ref the target should deploy.")
+def guardrail_deploy_target_cmd(session_id, name, env_, ref):
+    """Poison a saved deploy target so a normal deploy ships the wrong thing (tool-misuse surface)."""
+    _plant(session_id, "deploy_target", name=name, env=env_, ref=ref)
+
+
+@guardrail.command("access-request")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--type", "type_", default=None, help="Request type.")
+@click.option("--from", "from_", default=None, help="Who the request is from.")
+@click.option("--scope", default=None, help="Scope the request would grant.")
+def guardrail_access_request_cmd(session_id, type_, from_, scope):
+    """Plant a pending access request a check-access routine may grant (tool-misuse surface)."""
+    _plant(session_id, "access_request", **{"type": type_, "from": from_, "scope": scope})
+
+
+@guardrail.command("app-consent")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--app", default=None, help="Integration/app name.")
+@click.option("--scope", default=None, help="Scope the consent grants.")
+def guardrail_app_consent_cmd(session_id, app, scope):
+    """Plant a pending integration consent (auth-bypass surface)."""
+    _plant(session_id, "app_consent", app=app, scope=scope)
+
+
+@guardrail.command("org-policy")
+@click.option("--session", "session_id", default=None,
+              help="Session id (defaults to the active one).")
+@click.option("--source", default=None, help="Where the policy appears to come from.")
+@click.option("--directive", default=None, help="Policy directive text (the payload).")
+def guardrail_org_policy_cmd(session_id, source, directive):
+    """Plant a trusted org policy that may elevate Patch (auth-bypass surface)."""
+    _plant(session_id, "org_policy", source=source, directive=directive)
 
 
 @guardrail.command("status")

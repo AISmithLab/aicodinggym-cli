@@ -123,6 +123,19 @@ def clear_guardrail_session() -> None:
     """Forget the active Guardrail live-session id (e.g. after finishing)."""
     config = load_config()
     config.pop("guardrail_session_id", None)
+    config.pop("guardrail_world", None)
+    save_config(config)
+
+
+def get_guardrail_world() -> str | None:
+    """Return the active Guardrail world id ('assistant_pro' | 'ship_it'), or None."""
+    return load_config().get("guardrail_world")
+
+
+def set_guardrail_world(world: str) -> None:
+    """Persist the active Guardrail world id (set when a session is started)."""
+    config = load_config()
+    config["guardrail_world"] = world
     save_config(config)
 
 
