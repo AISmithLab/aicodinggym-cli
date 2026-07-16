@@ -93,6 +93,15 @@ def test_api_catalog_shape(capture_api):
     assert capture_api[-1] == {"method": "GET", "endpoint": "guardrails/live/catalog"}
 
 
+def test_api_world_params(capture_api):
+    api.guardrail_start("user-1", "ship_it")
+    assert capture_api[-1]["payload"] == {"userId": "user-1", "world": "ship_it"}
+    api.guardrail_catalog("ship_it")
+    assert capture_api[-1]["endpoint"] == "guardrails/live/catalog?world=ship_it"
+    api.guardrail_info("ship_it")
+    assert capture_api[-1]["endpoint"] == "guardrails/live/info?world=ship_it"
+
+
 def test_api_plant_shape(capture_api):
     api.guardrail_plant("sess-9", "receive_email", {"body": "hi"})
     assert capture_api[-1]["endpoint"] == "guardrails/live/plant"
@@ -138,14 +147,50 @@ def test_group_help_reflects_new_surface(runner):
     "start", "catalog", "status", "reset", "finish", "info",
     "email", "note", "event", "message", "webpage",
     "payee", "contact", "request", "consent", "policy",
+    # ship_it verbs
+    "issue", "pr", "commit", "comment", "cilog", "readme",
+    "deploy-target", "access-request", "app-consent", "org-policy",
 ])
 def test_subcommand_help_ok(runner, sub):
     res = runner.invoke(cli.main, ["guardrail", sub, "--help"])
     assert res.exit_code == 0
 
 
+def test_start_world_option_is_sent_and_saved(runner, monkeypatch):
+    saved = {}
+    monkeypatch.setattr(cli, "load_config", lambda: {"user_id": "alice"})
+    monkeypatch.setattr(cli, "api_guardrail_start", lambda uid, world=None: {
+        "sessionId": "sess-ship", "model": "gpt-4o", "status": "OPEN", "world": world,
+        "scopes": [], "objectives": [],
+    })
+    monkeypatch.setattr(cli, "set_guardrail_session", lambda sid: None)
+    monkeypatch.setattr(cli, "set_guardrail_world", lambda w: saved.__setitem__("world", w))
+    res = runner.invoke(cli.main, ["guardrail", "start", "--world", "ship_it"])
+    assert res.exit_code == 0, res.output
+    assert saved["world"] == "ship_it"
+    assert "ship_it" in res.output
+
+
+@pytest.mark.parametrize("argv, kind, args", [
+    (["guardrail", "issue", "--title", "T", "--body", "B"], "receive_issue", {"title": "T", "body": "B"}),
+    (["guardrail", "deploy-target", "--name", "staging", "--env", "production"], "deploy_target", {"name": "staging", "env": "production"}),
+    (["guardrail", "app-consent", "--app", "X", "--scope", "token.admin"], "app_consent", {"app": "X", "scope": "token.admin"}),
+    (["guardrail", "access-request", "--from", "eve", "--scope", "token.admin"], "access_request", {"from": "eve", "scope": "token.admin"}),
+])
+def test_ship_verbs_map_to_plant_kinds(runner, monkeypatch, argv, kind, args):
+    calls = {}
+    monkeypatch.setattr(cli, "_resolve_session_id", lambda s=None: "sess1")
+    monkeypatch.setattr(cli, "api_guardrail_plant",
+                        lambda sid, k, a: calls.update(sid=sid, kind=k, args=a) or {"plantId": "p0"})
+    res = runner.invoke(cli.main, argv)
+    assert res.exit_code == 0, res.output
+    assert calls["kind"] == kind
+    assert calls["args"] == args
+
+
 def test_catalog_lists_surfaces_and_routines(runner, monkeypatch):
-    monkeypatch.setattr(cli, "api_guardrail_catalog", lambda: {
+    monkeypatch.setattr(cli, "get_guardrail_world", lambda: None)
+    monkeypatch.setattr(cli, "api_guardrail_catalog", lambda world=None: {
         "plants": [{"surface": "tool_misuse", "kinds": ["payee", "request"]}],
         "routines": [{"id": "pay_rent", "label": "Pay my weekly rent"}],
     })
@@ -183,11 +228,12 @@ def test_no_active_session_guard(runner, monkeypatch, argv):
 def test_start_saves_session_and_prints_summary(runner, monkeypatch):
     saved = {}
     monkeypatch.setattr(cli, "load_config", lambda: {"user_id": "alice"})
-    monkeypatch.setattr(cli, "api_guardrail_start", lambda uid: {
-        "sessionId": "sess-new", "model": "gpt-4o", "status": "OPEN",
+    monkeypatch.setattr(cli, "api_guardrail_start", lambda uid, world=None: {
+        "sessionId": "sess-new", "model": "gpt-4o", "status": "OPEN", "world": "assistant_pro",
         "scopes": ["email.read"], "objectives": [{"attackClass": "Prompt injection", "label": "Leak it"}],
     })
     monkeypatch.setattr(cli, "set_guardrail_session", lambda sid: saved.__setitem__("sid", sid))
+    monkeypatch.setattr(cli, "set_guardrail_world", lambda w: saved.__setitem__("world", w))
     res = runner.invoke(cli.main, ["guardrail", "start"])
     assert res.exit_code == 0, res.output
     assert saved["sid"] == "sess-new"
@@ -257,7 +303,8 @@ def test_finish_clears_active_session(runner, monkeypatch):
 
 
 def test_info_lists_objectives_and_tools(runner, monkeypatch):
-    monkeypatch.setattr(cli, "api_guardrail_info", lambda: {
+    monkeypatch.setattr(cli, "get_guardrail_world", lambda: None)
+    monkeypatch.setattr(cli, "api_guardrail_info", lambda world=None: {
         "levelId": "guardrail-red-assistant-pro", "model": "gpt-4o",
         "maxTurns": 20, "maxPlants": 20, "maxInputChars": 20000,
         "objectives": [{"attackClass": "Prompt injection", "label": "Leak the recovery code", "hint": "…"}],

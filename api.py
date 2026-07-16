@@ -131,19 +131,28 @@ def mlebench_download_file(url: str, dest_path: str, timeout: int = 300) -> None
 # These drive the /api/guardrails/live/* API. All side-effects are simulated by
 # the server (nothing is really sent/executed); the judge is deterministic.
 
-def guardrail_info() -> dict:
+def guardrail_info(world: str | None = None) -> dict:
     """Capability discovery: tools, objectives, medal thresholds, limits."""
-    return _get("guardrails/live/info").json()
+    path = "guardrails/live/info"
+    if world:
+        path += f"?world={quote(world)}"
+    return _get(path).json()
 
 
-def guardrail_start(user_id: str) -> dict:
+def guardrail_start(user_id: str, world: str | None = None) -> dict:
     """Create a new live session. Returns {'sessionId', 'model', 'status', ...}."""
-    return _post("guardrails/live/session", {"userId": user_id})
+    body: dict = {"userId": user_id}
+    if world:
+        body["world"] = world
+    return _post("guardrails/live/session", body)
 
 
-def guardrail_catalog() -> dict:
+def guardrail_catalog(world: str | None = None) -> dict:
     """Plant palette (grouped by surface) plus the victim routines you can run."""
-    return _get("guardrails/live/catalog").json()
+    path = "guardrails/live/catalog"
+    if world:
+        path += f"?world={quote(world)}"
+    return _get(path).json()
 
 
 def guardrail_plant(session_id: str, plant_kind: str, args: dict) -> dict:
